@@ -28,7 +28,10 @@ export default function DefinirSenhaForm({
     const accessToken = params.get('access_token')
     const refreshToken = params.get('refresh_token')
 
+    // O fragmento da URL só existe no navegador, então não dá para ler no primeiro
+    // render sem divergir do HTML do servidor: o efeito é o lugar dessa leitura.
     if (params.get('error')) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setErroLink('Link inválido ou expirado. Solicite um novo.')
       return
     }

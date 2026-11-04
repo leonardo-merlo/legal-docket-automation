@@ -19,8 +19,11 @@ máquina dele — o Rafael só precisa dar um duplo-clique e pode fechar a janel
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # agent/, onde fica observabilidade.py
 
 import observabilidade as obs
 

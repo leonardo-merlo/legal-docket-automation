@@ -1,5 +1,5 @@
 @echo off
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo Iniciando controladoria...
 echo O Chrome vai abrir nos sistemas. Faca login em cada aba.

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  web:
+    name: web (lint, type-check, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test
+
+  agent:
+    name: agent (tests)
+    # The agent is a Windows desktop process (Chrome over CDP, .bat launchers),
+    # so its tests run on Windows too.
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: agent
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: agent/requirements.txt
+      - run: pip install -r requirements.txt
+      # Each test file is a plain script that exits non-zero on the first failed assert.
+      # Court systems, Supabase and the Claude API are faked. test_chrome_recuperacao
+      # is left out: it reproduces a tab frozen by an alert in a real Chrome, and the
+      # runner's Chrome does not freeze the same way. It runs locally.
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($t in Get-ChildItem test_*.py | Where-Object Name -ne 'test_chrome_recuperacao.py') {
+            Write-Host "::group::$($t.Name)"
+            python $t.Name
+            if ($LASTEXITCODE -ne 0) { throw "$($t.Name) failed" }
+            Write-Host "::endgroup::"
+          }

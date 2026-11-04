@@ -12,7 +12,7 @@ abas dos sistemas necessários e fica observando o login. **Assim que você loga
 todos os sistemas, a extração começa sozinha** — sem precisar apertar Enter nem
 rodar um segundo comando.
 
-No Windows também dá pra dar duplo-clique em `iniciar.bat`.
+No Windows também dá pra dar duplo-clique em `windows/iniciar.bat`.
 
 > Timeout padrão de login: 10 minutos. Se um sistema não logar nesse tempo, o
 > script avisa quais faltaram e encerra.
@@ -75,7 +75,7 @@ source venv/bin/activate
 ## 3. Testar a conexão CDP
 
 ```bash
-python test_connection.py
+python tools/check_chrome.py
 ```
 
 Deve imprimir `✅ CDP OK` e listar as abas abertas.

@@ -1,0 +1,8 @@
+# Each app has its own .gitignore (web/, agent/). These apply repo-wide.
+.env
+.env.*
+!.env.example
+.mcp.json
+.claude/
+.vscode/
+.idea/

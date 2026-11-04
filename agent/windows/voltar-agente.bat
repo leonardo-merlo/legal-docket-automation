@@ -1,6 +1,6 @@
 @echo off
 title Voltar o Agente da Controladoria
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo ==================================================
 echo    RELIGANDO O AGENTE NESTE COMPUTADOR

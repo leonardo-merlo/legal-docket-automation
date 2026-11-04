@@ -1,6 +1,6 @@
 @echo off
 title Controladoria - Tirar a janela duplicada
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo ==================================================
 echo    TIRAR A JANELA DUPLICADA DO AGENTE

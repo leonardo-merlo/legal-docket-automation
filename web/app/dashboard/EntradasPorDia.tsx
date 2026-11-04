@@ -169,12 +169,7 @@ export default function EntradasPorDia({
 
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current)
-    const digits = busca.replace(/\D/g, '')
-    if (digits.length < 4) {
-      setResultados(null)
-      setBuscaErro(null)
-      return
-    }
+    if (busca.replace(/\D/g, '').length < 4) return
     debounceRef.current = setTimeout(() => {
       setBuscaErro(null)
       startTransition(async () => {
@@ -188,6 +183,14 @@ export default function EntradasPorDia({
     }, 400)
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
   }, [busca])
+
+  function handleBuscaChange(valor: string) {
+    setBusca(valor)
+    if (valor.replace(/\D/g, '').length < 4) {
+      setResultados(null)
+      setBuscaErro(null)
+    }
+  }
 
   function handleLimpar() {
     setBusca('')
@@ -278,7 +281,7 @@ export default function EntradasPorDia({
             type="text"
             placeholder="Buscar CNJ…"
             value={busca}
-            onChange={(e) => setBusca(e.target.value)}
+            onChange={(e) => handleBuscaChange(e.target.value)}
             className="flex-1 rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-text placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent/50"
           />
           {isPending && (

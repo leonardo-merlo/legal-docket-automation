@@ -26,7 +26,7 @@ cd C:\Users\<usuario>\controladoria-playwright
 
 ## 4 e 5. Criar o venv e instalar as dependências
 
-**Jeito fácil:** dar **duplo-clique no `setup.bat`**. Ele faz tudo isto sozinho
+**Jeito fácil:** dar **duplo-clique no `windows/setup.bat`**. Ele faz tudo isto sozinho
 (criar o venv + instalar as dependências + o navegador) e avisa quando terminar.
 
 **Manualmente (se preferir):**
@@ -52,7 +52,7 @@ SUPABASE_SERVICE_KEY=...  # service_role key
 
 ## 7. Testar
 
-Dar duplo-clique em `agente.bat` (ou no atalho da área de trabalho). A janela deve
+Dar duplo-clique em `windows/agente.bat` (ou no atalho da área de trabalho). A janela deve
 abrir e ficar "ouvindo" os comandos do app. Deixar essa janela aberta enquanto usa.
 
 ## 8. (Opcional) Atalho na área de trabalho
@@ -60,7 +60,7 @@ abrir e ficar "ouvindo" os comandos do app. Deixar essa janela aberta enquanto u
 Para criar o atalho de "Agente Controladoria", rodar no PowerShell:
 
 ```powershell
-$bat = "$PWD\agente.bat"
+$bat = "$PWD\windows\agente.bat"
 $ws = New-Object -ComObject WScript.Shell
 $sc = $ws.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\Agente Controladoria.lnk")
 $sc.TargetPath = $bat; $sc.WorkingDirectory = "$PWD"; $sc.Save()

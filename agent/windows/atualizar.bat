@@ -1,6 +1,6 @@
 @echo off
 title Atualizar Sistema da Controladoria
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo ==================================================
 echo    ATUALIZANDO O SISTEMA DA CONTROLADORIA

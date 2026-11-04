@@ -112,6 +112,8 @@ export default function BotaoIniciar() {
   }
 
   useEffect(() => {
+    // Falso positivo da regra: todo setState de carregarUltimo vem depois do await fetch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     carregarUltimo()
     const id = setInterval(carregarUltimo, 3000)
     return () => clearInterval(id)
