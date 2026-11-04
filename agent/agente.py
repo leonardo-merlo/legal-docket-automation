@@ -1,0 +1,601 @@
+"""
+agente.py — Agente local da controladoria.
+
+Fica rodando na máquina do operador, consultando a tabela `comandos` no Supabase
+a cada poucos segundos. Quando encontra um comando pendente, executa a ação dele
+(ver ACOES) e grava o resultado de volta no Supabase.
+
+Não abre portas nem recebe conexões: só consulta o Supabase de tempos em tempos.
+
+Uso:
+  python agente.py
+"""
+
+import asyncio
+import os
+import platform
+import sys
+import time
+import threading
+import traceback
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+from cnj_router import nome_sistema
+from iniciar import abrir_sistemas, extrair, main as executar_extracao
+from reanalisar import listar_sem_rascunho, reanalisar_um
+from runner import rodada_foi_encerrada
+from supabase_writer import _get_client, _carregar_env
+import observabilidade as obs
+
+INTERVALO_S = 3
+
+# As ações que o painel pode mandar.
+#
+# `iniciar` é o fluxo antigo — abre, espera o login e extrai, tudo num clique. Ele
+# continua existindo intacto de propósito: um agente novo tem de entender o painel
+# velho, e um painel novo, o agente velho. Só assim a atualização das duas pontas
+# pode acontecer em dias diferentes sem deixar o Rafael sem sistema no meio.
+#
+# `abrir_sistemas` e `extrair` são o mesmo fluxo em dois tempos, que é o que
+# resolve o problema: com o login separado, ninguém tenta extrair antes da hora.
+ACAO_INICIAR = "iniciar"
+ACAO_ABRIR = "abrir_sistemas"
+ACAO_EXTRAIR = "extrair"
+ACOES = (ACAO_INICIAR, ACAO_ABRIR, ACAO_EXTRAIR)
+
+# O que aparece no painel enquanto a ação roda. Quem lê é o Rafael, então cada
+# uma diz o que ele deve fazer agora — não o que o programa está fazendo.
+MENSAGEM_INICIAL = {
+    ACAO_INICIAR: "Abrindo navegador. Faça login nos sistemas.",
+    ACAO_ABRIR: "Abrindo os sistemas. Faça login com calma — nada começa sozinho.",
+    ACAO_EXTRAIR: "Extraindo os processos...",
+}
+
+# Enquanto este arquivo existir na pasta, o agente ignora comandos novos. Serve
+# para tirar uma máquina do ar — por exemplo, rodar as extrações noutro
+# computador — sem mexer na inicialização do Windows e sem depender de alguém
+# lembrar de fechar a janela: o agente pode subir sozinho que fica quieto.
+# Está no .gitignore de propósito, para o atualizar.bat não apagá-lo.
+# Não interrompe rodada em andamento: só impede que a próxima comece.
+NOME_ARQUIVO_PAUSA = "AGENTE-PAUSADO.txt"
+
+# Com o sistema em mais de um computador (Rafael e Marina, desde 10/2026), o
+# pedido do painel diz em qual computador rodar (`comandos.computador`) e cada
+# agente só pega os seus — antes, o primeiro agente ligado pegava qualquer um, e
+# o Rafael clicava no dele para a extração abrir no Chrome da Marina.
+# Pedido sem computador (painel antigo, ou antes de algum agente se registrar)
+# continua valendo para qualquer um.
+# A presença em `agentes` é o que deixa o painel perguntar "qual é este
+# computador?" e avisar quando o agente escolhido está desligado.
+INTERVALO_PRESENCA_S = 30
+
+# Uma rodada de extração leva 20-45min. Um comando 'em_andamento' mais antigo
+# que isto é tratado como rodada abandonada (agente caiu no meio) e deixa de
+# bloquear novas rodadas — senão a fila travaria pra sempre após um crash.
+LIMITE_RODADA_ABANDONADA_MIN = 90
+
+# De quanto em quanto tempo a rodada avisa que ainda está viva (ver _bater_ponto).
+# Bem menor que o limite acima: um batimento perdido não pode custar a trava.
+# Era 5 min; virou 1 min em 12/10/2026 para a varredura de rodadas interrompidas
+# (ver marcar_interrompidas) poder distinguir rodada viva de morta em minutos.
+INTERVALO_BATIMENTO_S = 60
+
+# Rodada interrompida: computador desligado, bateria, janela fechada no meio.
+# Ninguém encerrava o comando e ele ficava 'em_andamento' para sempre — a de
+# 09/10 ficou assim. O agente parado confere de tempos em tempos e encerra:
+# - as rodadas DESTE computador sem batimento há mais de 10 min (ele está
+#   parado, então nenhuma delas é dele rodando agora; 10 batimentos perdidos
+#   cobrem uma janela duplicada do agente que ainda esteja viva)
+# - as de qualquer computador sem notícia há mais que LIMITE_RODADA_ABANDONADA_MIN
+# Notebook com a tampa fechada não entra aqui: o agente fica suspenso, não
+# reinicia, e ao reabrir continua a rodada normalmente.
+INTERVALO_VARREDURA_S = 60
+LIMITE_SEM_BATIMENTO_PROPRIO_MIN = 10
+MENSAGEM_INTERROMPIDA = (
+    "Interrompida: o agente parou no meio da rodada (computador desligado ou "
+    "janela fechada). Os processos já analisados ficaram salvos."
+)
+
+# 'Abrir sistemas' não espera login nem processa nada — nas rodadas medidas
+# levou de 3 a 13s. Em 08/09 travou em silêncio (nem erro, nem sucesso, nada
+# gravado) por mais de 30 min: o primeiro passo dela é uma chamada ao Supabase
+# sem limite de tempo, e uma rede engasgada ali prende a função para sempre. O
+# comando ficou 'em_andamento' e o painel travou os dois botões sem nenhum
+# diagnóstico até alguém destravar na mão pelo banco.
+# Este teto é só para essa ação: 'extrair' já tem suas próprias proteções
+# (LIMITE_FALHAS_CDP, o timeout do connect_over_cdp) porque ela é longa de
+# propósito. Aqui não — passar disso é sinal de travamento, não de trabalho.
+TIMEOUT_ABRIR_SISTEMAS_S = 180
+
+# Onde fica a cópia em arquivo do que aparece na janela do agente. Um arquivo por
+# dia, ao lado do código, no .gitignore.
+#
+# Existe porque até 17/08 a saída morava só no console: quando a rodada do
+# Rafael falhou, o texto real do erro tinha rolado para fora da tela e o
+# diagnóstico teve de ser reconstruído por dedução, a partir de timestamps e
+# durações no banco. Log é mais barato que dedução.
+PASTA_LOGS = "logs"
+
+
+# Trechos que aparecem quando a máquina está sem rede. O agente sobe junto com o
+# Windows, antes de o Wi-Fi conectar, e passa alguns minutos sem conseguir falar
+# com o Supabase — situação normal, não defeito.
+ERROS_DE_REDE = (
+    "getaddrinfo failed",
+    "11001",
+    "Name or service not known",
+    "Temporary failure in name resolution",
+    "Max retries exceeded",
+    "Connection aborted",
+    "Connection reset",
+    "10054",
+)
+
+
+class _Tee:
+    """
+    Escreve no console E no arquivo de log, sem trocar um pelo outro.
+
+    O Rafael acompanha a janela do agente — mandar tudo para arquivo deixaria
+    ele sem retorno nenhum. Falha de escrita no arquivo é engolida de propósito:
+    disco cheio ou arquivo travado pelo antivírus não pode derrubar a extração.
+    """
+
+    def __init__(self, console, arquivo) -> None:
+        self._console = console
+        self._arquivo = arquivo
+
+    def write(self, texto: str) -> int:
+        try:
+            self._arquivo.write(texto)
+            self._arquivo.flush()
+        except Exception:  # noqa: BLE001 — log é conveniência, não pode derrubar
+            pass
+        return self._console.write(texto)
+
+    def flush(self) -> None:
+        self._console.flush()
+
+    def __getattr__(self, nome: str):
+        return getattr(self._console, nome)
+
+
+def ligar_log(pasta: Path | None = None) -> Path | None:
+    """Duplica stdout e stderr para logs/agente-AAAA-MM-DD.log. Devolve o caminho."""
+    base = (pasta or Path(__file__).parent) / PASTA_LOGS
+    try:
+        base.mkdir(exist_ok=True)
+        caminho = base / f"agente-{date.today()}.log"
+        arquivo = caminho.open("a", encoding="utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001 — sem log o agente roda igual
+        print(f"Aviso: não foi possível abrir o log ({e}) — seguindo sem arquivo.")
+        return None
+    arquivo.write(f"\n===== agente iniciado em {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+    sys.stdout = _Tee(sys.stdout, arquivo)
+    sys.stderr = _Tee(sys.stderr, arquivo)
+    return caminho
+
+
+def esta_pausado(pasta: Path | None = None) -> bool:
+    """Esta máquina foi colocada em pausa? Ver NOME_ARQUIVO_PAUSA."""
+    base = pasta or Path(__file__).parent
+    return (base / NOME_ARQUIVO_PAUSA).exists()
+
+
+def resumir_erro_do_loop(erro: str) -> str:
+    """
+    Vira a linha que aparece na janela do agente. Função pura — ver test_agente.py.
+
+    Falha de rede recebe texto de gente: quem olha essa janela é o Rafael, e
+    "getaddrinfo failed" não diz nada para ele.
+    """
+    if any(marca in erro for marca in ERROS_DE_REDE):
+        return "Sem conexão com a internet — aguardando a rede voltar..."
+    return f"Erro no loop do agente: {erro}"
+
+
+def deve_imprimir(mensagem: str, ultima_mensagem: str | None) -> bool:
+    """
+    Só imprime quando a mensagem muda. Função pura — ver test_agente.py.
+
+    Sem isto, uma falha que se repete a cada 3s vira parede de texto: em 15/08 a
+    janela do Rafael encheu de erro de rede repetido e pareceu que o agente
+    tinha quebrado, quando ele estava só esperando o Wi-Fi subir.
+    """
+    return mensagem != ultima_mensagem
+
+
+def proximo_pendente(comandos: list[dict]) -> dict | None:
+    """Dentre os comandos recebidos, escolhe o mais antigo com status 'pendente'."""
+    pendentes = [c for c in comandos if c.get("status") == "pendente"]
+    if not pendentes:
+        return None
+    return sorted(pendentes, key=lambda c: c.get("criado_em", ""))[0]
+
+
+def identidade(ambiente: dict[str, str] | None = None) -> tuple[str, str]:
+    """(id do computador, nome que o painel mostra). Função pura sobre o ambiente.
+
+    O id é o nome do computador no Windows, que não muda com atualização nem com
+    reinstalação na mesma máquina. O nome nasce do usuário do Windows ("marina" →
+    "Marina") e depois pode ser corrigido no banco — o agente nunca o sobrescreve.
+    """
+    ambiente = os.environ if ambiente is None else ambiente
+    computador = (ambiente.get("COMPUTERNAME") or platform.node() or "desconhecido").strip()
+    usuario = (ambiente.get("USERNAME") or "").strip()
+    return computador, (usuario.capitalize() if usuario else computador)
+
+
+def registrar_presenca(client, computador: str, nome: str, usuario: str) -> None:
+    existe = client.table("agentes").select("id").eq("id", computador).limit(1).execute()
+    agora = datetime.now(timezone.utc).isoformat()
+    if existe.data:
+        client.table("agentes").update(
+            {"visto_em": agora, "usuario_windows": usuario}
+        ).eq("id", computador).execute()
+    else:
+        client.table("agentes").insert(
+            {"id": computador, "nome": nome, "usuario_windows": usuario, "visto_em": agora}
+        ).execute()
+
+
+def _manter_presenca(computador: str, nome: str, usuario: str) -> None:
+    """Thread própria: durante uma extração o loop principal fica preso nela por
+    até uma hora, e o painel não pode achar que o agente desligou nesse tempo.
+    Cliente próprio pelo mesmo motivo de _bater_ponto. Falhar aqui nunca derruba nada."""
+    try:
+        client = _get_client()
+    except Exception:  # noqa: BLE001
+        return
+    while True:
+        try:
+            registrar_presenca(client, computador, nome, usuario)
+        except Exception:  # noqa: BLE001 — sem rede agora, tenta no próximo ciclo
+            pass
+        time.sleep(INTERVALO_PRESENCA_S)
+
+
+def filtro_do_computador(computador: str) -> str:
+    """Pedidos deste computador ou sem computador. Formato do `or` do PostgREST."""
+    return f'computador.is.null,computador.eq."{computador}"'
+
+
+def buscar_pendentes(client, computador: str) -> list[dict]:
+    res = (
+        client.table("comandos")
+        .select("id, acao, status, criado_em")
+        .eq("status", "pendente")
+        .or_(filtro_do_computador(computador))
+        .order("criado_em")
+        .execute()
+    )
+    return res.data or []
+
+
+def _bater_ponto(comando_id: str, parar: threading.Event) -> None:
+    """
+    Renova `atualizado_em` do comando enquanto a rodada está acontecendo.
+
+    Existe por causa de 09/09/2026. `ha_rodada_em_andamento` ignora comandos com
+    `atualizado_em` mais velho que LIMITE_RODADA_ABANDONADA_MIN, e nada tocava
+    esse campo entre o claim e o desfecho — então **toda rodada mais longa que o
+    limite deixava de segurar a própria trava, ainda rodando**. A constante
+    assume "20-45min"; naquele dia a fila tinha 73 processos e a rodada passou
+    de 90 minutos. A trava venceu às 12:42 com o PJe no processo 22 de 33, e a
+    partir dali qualquer clique em Iniciar extração subiria uma SEGUNDA rodada
+    mexendo nas mesmas abas do mesmo Chrome. Foi renovada na mão para o teste
+    daquele dia não virar exatamente isso.
+
+    Cliente próprio de propósito: este é o único código que roda fora da thread
+    principal, e dividir o cliente com a extração seria criar um problema de
+    concorrência bem no lugar que existe para evitar um.
+
+    O update é condicionado a 'em_andamento': se o comando já terminou, ou foi
+    marcado com erro, o batimento não ressuscita nada.
+
+    Falhar aqui nunca derruba a rodada — mesma regra da observabilidade: quem
+    registra é testemunha, não juiz.
+    """
+    try:
+        client = _get_client()
+    except Exception:  # noqa: BLE001 — sem cliente, sem batimento; a rodada segue
+        return
+    while not parar.wait(INTERVALO_BATIMENTO_S):
+        try:
+            client.table("comandos").update(
+                {"atualizado_em": datetime.now(timezone.utc).isoformat()}
+            ).eq("id", comando_id).eq("status", "em_andamento").execute()
+        except Exception:  # noqa: BLE001 — ver o docstring
+            pass
+
+
+def marcar(client, comando_id: str, status: str, mensagem: str | None = None) -> None:
+    update: dict = {
+        "status": status,
+        "atualizado_em": datetime.now(timezone.utc).isoformat(),
+    }
+    if mensagem is not None:
+        update["mensagem"] = mensagem
+    client.table("comandos").update(update).eq("id", comando_id).execute()
+
+
+def ha_rodada_em_andamento(client) -> bool:
+    """Camada (b) — exclusão mútua global: True se já existe uma extração em
+    curso (outro agente rodando). Ignora rodadas abandonadas (ver constante)."""
+    limite = (
+        datetime.now(timezone.utc) - timedelta(minutes=LIMITE_RODADA_ABANDONADA_MIN)
+    ).isoformat()
+    res = (
+        client.table("comandos")
+        .select("id")
+        .eq("status", "em_andamento")
+        .gte("atualizado_em", limite)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
+
+def marcar_interrompidas(client, computador: str, agora: datetime | None = None) -> int:
+    """Encerra as rodadas mortas (ver MENSAGEM_INTERROMPIDA). Só chamar com o
+    agente parado. Retorna quantas encerrou."""
+    agora = agora or datetime.now(timezone.utc)
+    encerrar = {
+        "status": "erro",
+        "mensagem": MENSAGEM_INTERROMPIDA,
+        "atualizado_em": agora.isoformat(),
+    }
+    proprias = (
+        client.table("comandos").update(encerrar)
+        .eq("status", "em_andamento")
+        .eq("computador", computador)
+        .lt("atualizado_em",
+            (agora - timedelta(minutes=LIMITE_SEM_BATIMENTO_PROPRIO_MIN)).isoformat())
+        .execute()
+    )
+    abandonadas = (
+        client.table("comandos").update(encerrar)
+        .eq("status", "em_andamento")
+        .lt("atualizado_em",
+            (agora - timedelta(minutes=LIMITE_RODADA_ABANDONADA_MIN)).isoformat())
+        .execute()
+    )
+    return len(proprias.data or []) + len(abandonadas.data or [])
+
+
+def reivindicar(client, comando_id: str, mensagem: str) -> bool:
+    """Camada (a) — claim atômico: marca 'em_andamento' SOMENTE se o comando
+    ainda estiver 'pendente', numa única operação. Retorna True apenas se ESTE
+    agente foi quem o pegou (se outro pegou antes, o update afeta 0 linhas)."""
+    res = (
+        client.table("comandos")
+        .update({
+            "status": "em_andamento",
+            "mensagem": mensagem,
+            "atualizado_em": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("id", comando_id)
+        .eq("status", "pendente")
+        .execute()
+    )
+    return len(res.data or []) == 1
+
+
+def processar_um(client, computador: str) -> bool:
+    """Pega e executa um comando pendente. Retorna True se executou algo."""
+    # Camada (b): não inicia uma rodada se outra já estiver em andamento.
+    if ha_rodada_em_andamento(client):
+        return False
+
+    comando = proximo_pendente(buscar_pendentes(client, computador))
+    if not comando:
+        return False
+
+    cid = comando["id"]
+    acao = comando.get("acao") or ACAO_INICIAR
+    # Camada (a): só segue se conseguir reivindicar o comando atomicamente.
+    if not reivindicar(client, cid, MENSAGEM_INICIAL.get(acao, "Executando...")):
+        return False
+
+    print(f"Comando recebido: {acao} ({cid[:8]})")
+    # Daqui até o fim do comando, todo evento registrado fica amarrado a esta
+    # rodada — é o que permite pedir "me mostre a rodada das 20:03 inteira"
+    # numa consulta só.
+    obs.iniciar_rodada(cid)
+    parar_batimento = threading.Event()
+    batimento = threading.Thread(
+        target=_bater_ponto, args=(cid, parar_batimento), daemon=True
+    )
+    batimento.start()
+    try:
+        if acao not in ACOES:
+            # Painel mais novo que o agente: dizer isso é melhor do que rodar uma
+            # extração que ninguém pediu, e melhor do que deixar o comando pendente
+            # para sempre travando a fila.
+            marcar(client, cid, "erro",
+                   f"Ação '{acao}' desconhecida — atualize o agente (atualizar.bat).")
+            print(f"Comando erro: ação desconhecida '{acao}'")
+            return True
+
+        if acao == ACAO_ABRIR:
+            try:
+                resultado_abrir = asyncio.run(
+                    asyncio.wait_for(abrir_sistemas(), timeout=TIMEOUT_ABRIR_SISTEMAS_S)
+                )
+            except asyncio.TimeoutError:
+                status, mensagem = "erro", (
+                    f"Abrir sistemas não respondeu em {TIMEOUT_ABRIR_SISTEMAS_S // 60} min "
+                    "— provável travamento na conexão. Feche o Chrome e a janela do agente, "
+                    "e rode atualizar.bat de novo."
+                )
+            else:
+                status, mensagem = _resumo_abertura_para_status(resultado_abrir or {})
+        else:
+            resumo = asyncio.run(extrair() if acao == ACAO_EXTRAIR else executar_extracao()) or {}
+            if rodada_foi_encerrada():
+                # dada como interrompida enquanto este computador dormia: a
+                # etiqueta "Interrompida" fica, e a reanálise é da rodada nova
+                print("Rodada encerrada por fora enquanto rodava — mantendo 'Interrompida'.")
+                return True
+            resumo["reanalisados"] = varrer_sem_rascunho(client)
+            status, mensagem = _resumo_para_status(resumo)
+        marcar(client, cid, status, mensagem)
+        print(f"Comando {status}: {mensagem}")
+    except Exception as e:  # noqa: BLE001 — agente não pode morrer por um comando
+        marcar(client, cid, "erro", f"Erro: {e}")
+        print(f"Erro ao executar comando: {e}")
+        obs.registrar("comando.excecao", ok=False, detalhe=f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+    finally:
+        parar_batimento.set()
+        obs.encerrar_rodada()
+    return True
+
+
+def varrer_sem_rascunho(client) -> int:
+    """
+    Reanalisa quem ficou 'processado' sem rascunho. Retorna quantos foram salvos.
+
+    Existe porque a extração é incremental: se a análise falha depois de os
+    documentos serem salvos (agente morre no meio, API fora do ar, resposta
+    truncada), o processo fica 'processado' e a rodada seguinte não acha documento
+    novo, conclui "nada novo" e segue. Ninguém repara — no painel ele aparece
+    pronto, sem prazo nenhum, que é o pior desfecho num controle de prazo.
+    Não abre navegador nem precisa de login: trabalha sobre o que já está no banco.
+    """
+    try:
+        alvos = listar_sem_rascunho(client)
+    except Exception as e:  # noqa: BLE001 — varredura não pode derrubar a rodada
+        print(f"Varredura de rascunhos: falhou ao listar ({e}) — seguindo.")
+        return 0
+
+    if not alvos:
+        return 0
+
+    print(f"\nVarredura: {len(alvos)} processo(s) sem rascunho — reanalisando...")
+    salvos = 0
+    for processo in alvos:
+        cnj = processo["numero_cnj"]
+        try:
+            resultado = reanalisar_um(client, processo)
+            print(f"  {cnj} — {resultado}")
+            # reanalisar_um devolve texto; só "OK" significa rascunho gravado
+            if resultado.startswith("OK"):
+                salvos += 1
+        except Exception as e:  # noqa: BLE001 — um processo ruim não para a lista
+            print(f"  {cnj} — ERRO na reanálise: {e}")
+    return salvos
+
+
+def _resumo_abertura_para_status(resumo: dict) -> tuple[str, str]:
+    """Traduz o resultado de `abrir_sistemas` em (status, mensagem) para o painel."""
+    sistemas = resumo.get("sistemas") or []
+    if resumo.get("cdp_falhou"):
+        return "erro", "Não foi possível abrir o navegador (CDP)."
+    if not sistemas:
+        return "concluido", "Nenhum processo pendente — nada a abrir."
+
+    # Até 08/09 esta frase listava os sistemas que PRECISAVAM ser abertos, não
+    # os que abriram. O eProc TJMG apareceu aqui como aberto, e 24 minutos
+    # depois a extração não achou aba nenhuma dele. Agora quem não abriu é dito
+    # pelo nome, porque é ele que precisa de ação antes de extrair.
+    faltando = resumo.get("faltando") or []
+    abertos = [s for s in sistemas if s not in faltando]
+    if faltando:
+        nomes_faltando = ", ".join(nome_sistema(s) for s in faltando)
+        abriu = (f"Abri {', '.join(nome_sistema(s) for s in abertos)}. " if abertos else "")
+        return "erro", (f"{abriu}NÃO consegui abrir: {nomes_faltando}. "
+                        "Abra manualmente e faça login antes de extrair.")
+    nomes = ", ".join(nome_sistema(s) for s in sistemas)
+    return "concluido", f"Abri {nomes}. Faça login e clique em Iniciar extração."
+
+
+def _resumo_para_status(resumo: dict) -> tuple[str, str]:
+    """Traduz o resumo da extração em (status, mensagem) honestos para o app."""
+    total = resumo.get("total", 0)
+    n_ok = resumo.get("processados", 0)
+    n_err = resumo.get("erros", 0)
+    n_rev = resumo.get("revisao_manual", 0)
+    n_novo = resumo.get("nada_novo", 0)
+    n_rean = resumo.get("reanalisados", 0)
+    n_fila = resumo.get("devolvidos", 0)
+
+    # processo salvo sem análise não conta como erro, mas não pode passar em
+    # silêncio: ele aparece no painel como pronto e sem prazo nenhum.
+    aviso = f" {n_rev} sem análise — revisar." if n_rev else ""
+    # já estavam extraídos e não tinham documento novo: sucesso, mas não é
+    # extração desta rodada — somar no total faria o painel inflar o número.
+    novidade = f", {n_novo} sem novidade" if n_novo else ""
+    # análise recuperada de rodada anterior — não é extração desta, mas o Rafael
+    # precisa saber que apareceu rascunho novo em processo que ele já dava por visto.
+    recuperados = f" {n_rean} análise(s) recuperada(s)." if n_rean else ""
+    # nem erro nem sucesso: não chegaram a ser tentados e continuam na fila. Sem
+    # esta parte, a rodada de 17/08 devolveu 14 processos e mesmo assim o painel
+    # disse "concluído — 4 processado(s)", sem uma palavra sobre os outros.
+    na_fila = f" {n_fila} de volta na fila." if n_fila else ""
+
+    if resumo.get("cdp_falhou"):
+        return "erro", "Não foi possível abrir o navegador (CDP)."
+    if total == 0:
+        return "concluido", f"Nenhum processo pendente.{recuperados}"
+    if n_ok == 0 and n_novo == 0:
+        # Dizer a causa quando ela é conhecida, em vez de chutar "faltou login".
+        # Em 16/08 essa pergunta apareceu duas vezes numa rodada em que os erros
+        # eram todos certificado digital — o login estava perfeito, e a mensagem
+        # mandava o Rafael conferir justamente o que não tinha problema.
+        principal = resumo.get("motivo_principal")
+        if principal:
+            return "erro", f"Nada extraído ({n_err} com erro): {principal}.{na_fila}{recuperados}"
+        return "erro", f"Nada extraído ({n_err} com erro). Login não concluído? Verifique.{na_fila}{recuperados}"
+    if n_err > 0:
+        return "concluido", f"{n_ok} processado(s){novidade}, {n_err} com erro.{na_fila}{aviso}{recuperados}"
+    return "concluido", f"{n_ok} processado(s){novidade}.{na_fila}{aviso}{recuperados}"
+
+
+def main_loop() -> None:
+    caminho_log = ligar_log()
+    _carregar_env()
+    client = _get_client()
+    computador, nome = identidade()
+    usuario = os.environ.get("USERNAME", "")
+    threading.Thread(
+        target=_manter_presenca, args=(computador, nome, usuario), daemon=True
+    ).start()
+    print("Agente da controladoria iniciado. Aguardando comandos (Ctrl+C para sair)...")
+    print(f"Este computador: {computador}")
+    if caminho_log:
+        print(f"Log desta rodada: {caminho_log}")
+    avisou_pausa = False
+    ultimo_aviso: str | None = None
+    proxima_varredura = 0.0
+    while True:
+        try:
+            if esta_pausado():
+                if not avisou_pausa:
+                    print(f"\nAGENTE PAUSADO nesta máquina ({NOME_ARQUIVO_PAUSA} existe).")
+                    print("Nenhuma extração será executada aqui. Para religar, use voltar-agente.bat\n")
+                    avisou_pausa = True
+            else:
+                if avisou_pausa:
+                    print("\nAgente religado. Aguardando comandos...\n")
+                    avisou_pausa = False
+                executou = processar_um(client, computador)
+                if not executou and time.monotonic() >= proxima_varredura:
+                    proxima_varredura = time.monotonic() + INTERVALO_VARREDURA_S
+                    encerradas = marcar_interrompidas(client, computador)
+                    if encerradas:
+                        print(f"{encerradas} rodada(s) interrompida(s) encerrada(s) no painel.")
+            if ultimo_aviso is not None:
+                print("Conexão restabelecida. Aguardando comandos...")
+                ultimo_aviso = None
+        except Exception as e:  # noqa: BLE001 — loop nunca para por erro de rede
+            aviso = resumir_erro_do_loop(str(e))
+            if deve_imprimir(aviso, ultimo_aviso):
+                print(aviso)
+                ultimo_aviso = aviso
+        time.sleep(INTERVALO_S)
+
+
+if __name__ == "__main__":
+    main_loop()

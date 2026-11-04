@@ -1,0 +1,35 @@
+# Credenciais — nunca commitar
+.env
+
+# Ambiente virtual Python
+venv/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Saídas geradas pelo sistema
+outputs/
+drafts/
+inputs/
+debug_outputs/
+
+# Arquivos de debug do Chrome
+/tmp/
+
+# Claude — ferramentas locais, não versionar
+.claude/
+
+# Logs de tarefas em background / saída do agente
+*.output
+
+# Pausa do agente — é por máquina, e precisa sobreviver ao atualizar.bat
+AGENTE-PAUSADO.txt
+
+# saída do agente, uma por dia — ver agente.ligar_log
+logs/
+
+# Atalhos de inicializacao que o Rafael desativou na maquina dele.
+# Ficam guardados para dar para voltar atras — nao pertencem ao repositorio.
+inicializacao-desativada/

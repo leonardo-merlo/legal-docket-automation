@@ -1,0 +1,1391 @@
+"""
+runner.py — Orquestra extrações agrupadas por sistema judicial.
+
+Uso:
+  python runner.py              # lê do Supabase (padrão)
+  python runner.py --local      # usa inputs/<hoje>/cnj_list.txt
+  python runner.py --local 2026-06-09
+  python runner.py --todas      # todas as datas locais pendentes
+"""
+
+import asyncio
+import re
+import sys
+import time
+import urllib.parse
+from collections import defaultdict
+from datetime import date, timezone, datetime
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+from analyzer import analisar_processo
+from cnj_router import rotear_lista, motivo_sem_extrator, CNJInfo
+from extrator_dispatch import obter_extrator, esta_implementado, descricao_pendente
+from sistema_auth import (
+    preparar_autenticacao,
+    monitorar_logins_e_processar,
+    fechar_aba_cdp,
+    _get_abas_chrome,
+    _avaliar_login,
+    SEM_DETECCAO_DE_LOGIN,
+    SISTEMA_HOST,
+    SISTEMA_URLS,
+)
+from supabase_writer import salvar_no_supabase, _get_client, _carregar_env
+import observabilidade as obs
+import chrome_saude
+
+INPUTS_DIR = Path("inputs")
+
+MOTIVO_CHROME = ("Chrome parou de responder — feche o Chrome por completo, "
+                 "abra de novo, faça login e rode outra vez")
+# Notebook fechado por mais de 90 min no meio da rodada: o outro computador
+# encerra esta rodada (agente.marcar_interrompidas) e pode começar outra. Ao
+# reabrir, o agente acordaria e seguiria a fila junto com a rodada nova. Por
+# isso ele confere a etiqueta antes de cada processo e para se ela não for mais
+# dele. Não devolve nada à fila: os processos que faltam nunca saíram de
+# 'pendente', e a rodada nova pode estar mexendo neles agora.
+def rodada_foi_encerrada() -> bool:
+    comando_id = obs.comando_atual()
+    if not comando_id:
+        return False
+    try:
+        res = (_get_client().table("comandos").select("status")
+               .eq("id", comando_id).limit(1).execute())
+    except Exception:  # noqa: BLE001 — rede engasgada não é motivo para parar a rodada
+        return False
+    return bool(res.data) and res.data[0].get("status") != "em_andamento"
+
+
+MOTIVO_SESSAO = "Sessão caiu durante a rodada — refazer login e rodar de novo"
+MOTIVO_LOGIN_PENDENTE = "Login ainda não estava feito quando a extração tentou"
+MOTIVO_SEM_ABA = ("O sistema não estava aberto no Chrome quando chegou a vez dele — "
+                  "use Abrir sistemas antes de Iniciar extração")
+
+# A partir de quantos minutos de rodada uma sessão pode ter morrido sozinha
+# esperando a vez. Abaixo disso, falhar no primeiro processo ainda é a assinatura
+# de "ninguém logou ainda"; acima, é a de "logou e envelheceu".
+# 10 min é folgado de propósito: a sessão mais curta que a gente conhece durou
+# bem mais que isso, e chamar de "envelhecida" uma sessão que nunca existiu seria
+# trocar um diagnóstico errado por outro.
+LIMIAR_SESSAO_ENVELHECIDA_MIN = 10
+
+# Como o motivo antigo é preservado quando o processo volta para a fila. Ver
+# motivo_devolucao — sem isto, devolver à fila apagava o diagnóstico da rodada
+# anterior.
+MARCA_ANTES = " (antes: "
+
+MOTIVO_SISTEMA_TRAVOU = ("A aba deste sistema travou e o robô não conseguiu "
+                         "destravar — rode de novo")
+
+# Como a rodada trata o login. Eram dois valores num booleano (`modo_auto`) e
+# passaram a ser três quando "abrir os sistemas" virou um comando separado de
+# "extrair" — ver docs/handoff-2026-08-16-separar-login-e-painel.md.
+MODO_INTERATIVO = "interativo"       # abre as abas e espera Enter no terminal
+MODO_AUTO = "auto"                   # observa o Chrome e dispara sozinho
+MODO_ASSUMIR_LOGADO = "assumir_logado"  # o login já foi feito, vai direto
+MODOS = (MODO_INTERATIVO, MODO_AUTO, MODO_ASSUMIR_LOGADO)
+
+# Quem é logado primeiro é quem mais tempo passa parado esperando a vez. A sessão
+# do RUPE cai antes das outras, então ela vai na frente: com os logins todos
+# feitos ANTES da extração (ver a ação `abrir_sistemas`), a diferença entre ser o
+# primeiro e ser o último da fila pode ser meia hora de sessão envelhecendo.
+# Os que não estão listados mantêm a ordem em que chegaram.
+#
+# Os eProc entraram nesta lista em 31/08, na frente do PJe. Medido nos dias 19 a
+# 27/08: **35 processos do eProc nunca foram extraídos uma única vez**, todos
+# devolvidos à fila com "login não estava feito", enquanto o PJe e o RUPE não
+# perderam nenhum. A causa é a ordem: as rodadas duram de 43 a 59 minutos, o
+# bloco do PJe come quase tudo isso, e a vez do eProc chegava ~40 min depois de o
+# Rafael ter logado. O login estava feito — envelheceu esperando.
+#
+# O PJe vai por último porque é quem aguenta: em todos esses dias, nenhum
+# processo dele ficou parado por sessão, mesmo sendo o primeiro a rodar e
+# segurando a fila por 40 minutos. Alguém tem de ser o último; que seja quem tem
+# a sessão mais longa.
+PRIORIDADE_SISTEMAS = [
+    "pje_tjmg_2inst",   # RUPE
+    "eproc_tjmg",
+    "eproc_trf6",
+    "eproc_trf6_2g",
+    "eproc_trf2",
+]
+
+
+# ── helpers locais ────────────────────────────────────────────────
+
+def ler_cnjs_local(data_str: str) -> list[str]:
+    arquivo = INPUTS_DIR / data_str / "cnj_list.txt"
+    if not arquivo.exists():
+        return []
+    return [l.strip() for l in arquivo.read_text(encoding="utf-8-sig").splitlines()
+            if l.strip() and not l.startswith("#")]
+
+
+def datas_pendentes_local() -> list[str]:
+    if not INPUTS_DIR.exists():
+        return []
+    return sorted(p.name for p in INPUTS_DIR.iterdir() if p.is_dir())
+
+
+# ── Supabase inputs ───────────────────────────────────────────────
+
+def ler_cnjs_supabase() -> list[dict]:
+    _carregar_env()
+    client = _get_client()
+    res = (
+        client.table("processos")
+        .select("id, numero_cnj, fonte, lote_id, sistema, data_ultima_consulta,"
+                " motivo_ignorado")
+        .in_("pje_status", ["pendente", "erro_browser", "captcha_bloqueado"])
+        .eq("duplicata", False)
+        .order("data_entrada")
+        .execute()
+    )
+    return res.data or []
+
+
+def ids_com_documentos(ids: list[str]) -> set[str]:
+    """
+    Quais desses processos já têm documento salvo.
+    Serve de trava para a extração incremental: se a gravação anterior falhou no
+    meio (data_ultima_consulta gravada, documentos não), extrair a partir da data
+    de corte devolveria 0 documentos e o processo passaria por "nada novo" —
+    ficando 'processado' sem nenhum documento no banco.
+    """
+    if not ids:
+        return set()
+    _carregar_env()
+    client = _get_client()
+    encontrados: set[str] = set()
+    # in_() com lista grande estoura o tamanho da URL — vai em lotes.
+    for i in range(0, len(ids), 50):
+        res = (
+            client.table("documentos")
+            .select("processo_id")
+            .in_("processo_id", ids[i:i + 50])
+            .execute()
+        )
+        encontrados.update(r["processo_id"] for r in (res.data or []))
+    return encontrados
+
+
+def marcar_supabase(ids: list[str], status: str, motivo: str | None = None) -> None:
+    if not ids:
+        return
+    _carregar_env()
+    client = _get_client()
+    update: dict = {"pje_status": status}
+    if motivo:
+        update["motivo_ignorado"] = motivo
+    elif status == "processado":
+        # sem limpar, um processo que volta a dar certo carrega para sempre o
+        # motivo da falha anterior — o painel passa a mentir sobre o estado atual.
+        update["motivo_ignorado"] = None
+    client.table("processos").update(update).in_("id", ids).execute()
+
+
+def gravar_duracao(cnj_id: str, segundos: int) -> None:
+    """Quanto tempo este processo levou. Uma linha por CNJ, não em lote."""
+    _carregar_env()
+    client = _get_client()
+    client.table("processos").update(
+        {"duracao_extracao_s": segundos}
+    ).eq("id", cnj_id).execute()
+
+
+def duracao_segundos(inicio: float, fim: float) -> int:
+    """
+    Segundos inteiros entre dois instantes de time.monotonic().
+    Função pura — ver test_runner.py. Nunca negativo: número negativo gravado
+    envenena a média do painel de forma silenciosa.
+    """
+    return max(0, round(fim - inicio))
+
+
+def ordenar_sistemas(sistemas: list[str]) -> list[str]:
+    """
+    Em que ordem os sistemas são extraídos. Função pura — ver test_runner.py.
+
+    Antes a ordem saía de `list(por_sistema.keys())`, que segue a `data_entrada`
+    dos CNJs — acidental, portanto. Ver PRIORIDADE_SISTEMAS para o porquê do RUPE
+    na frente. Estável no resto: reordenar o que não precisa só tornaria a rodada
+    difícil de comparar com a de ontem.
+    """
+    prioritarios = [s for s in PRIORIDADE_SISTEMAS if s in sistemas]
+    restantes = [s for s in sistemas if s not in prioritarios]
+    return prioritarios + restantes
+
+
+def eh_nada_novo(total_documentos: int, data_corte: str | None) -> bool:
+    """
+    0 documentos numa extração incremental = nada mudou desde a última consulta.
+    É o desfecho normal de um processo já extraído que voltou à fila numa pauta
+    nova. Tratar isso como erro apagava do painel um processo que já estava
+    pronto, com documentos e rascunho salvos.
+    Na primeira extração (sem corte) 0 documentos continua sendo falha de verdade.
+    """
+    return total_documentos == 0 and bool(data_corte)
+
+
+def eh_queda_de_sessao(resultado: dict | None) -> bool:
+    """
+    O sistema não está pronto — todo CNJ seguinte da fila vai falhar igual.
+
+    Duas formas do mesmo desfecho. `sessao_expirada` é a aba aberta e deslogada.
+    "Nenhuma aba" é não haver aba nenhuma daquele sistema no Chrome do agente —
+    que é o estado normal antes de o operador logar, não um erro do processo.
+    Sem a segunda, cada CNJ virava `erro_browser` individualmente e o sistema
+    era dado como resolvido, matando as 3 retentativas de 5/10/15 min: em 14/08
+    a fila do eProc, TRF6 e RUPE (15 CNJs) foi queimada em 15 segundos, antes de
+    o Rafael ter chance de digitar a senha.
+    """
+    if not resultado:
+        return False
+    erro = str(resultado.get("erro") or "")
+    return "sessao_expirada" in erro or "Nenhuma aba" in erro
+
+
+def eh_chrome_inacessivel(resultado: dict | None) -> bool:
+    """
+    Não dá para falar com o Chrome. Insistir é pior que parar: cada CNJ gasta os
+    180s de timeout do Playwright antes de falhar, e uma fila de 20 vira uma hora
+    de nada. Além disso o Chrome nesse estado não se recupera sozinho — precisa
+    ser fechado e aberto de novo.
+    """
+    if not resultado:
+        return False
+    erro = str(resultado.get("erro") or "")
+    return "connect_over_cdp" in erro or "conectar ao Chrome" in erro
+
+
+# O que conta como página de tribunal, para a limpeza.
+#
+# É o sufixo, e não a lista de SISTEMA_HOST, porque os sistemas redirecionam para
+# hosts que não estão nela: medido em 19/08, abrir `pje.tjmg.jus.br` termina em
+# `sso.cloud.pje.jus.br`. Com a lista fechada, a aba vazada ficava para trás
+# justamente por ter ido para o login — que é onde ela mais costuma parar.
+#
+# Todo tribunal brasileiro mora em `.jus.br`, e nada do Rafael mora. O que ele
+# abrir (Gmail, Drive, pesquisa) não casa; e se ele tiver uma aba de tribunal
+# aberta, ela estava lá antes da rodada e a trava do `ids_no_inicio` já a protege.
+SUFIXO_JUDICIAL = ".jus.br"
+HOSTS_JUDICIAIS = frozenset(SISTEMA_HOST.values())  # usado pelo painel e pelos logs
+
+
+# Telas de login que um sistema usa mas não são o endereço dele. Aba parada
+# aqui é login em andamento ou esperando a vez: nunca é lixo de outro sistema.
+HOSTS_DE_LOGIN = frozenset({
+    "sso.cloud.pje.jus.br",
+    "sso-eproc.trf6.jus.br",
+    "certificado-sso-eproc.trf6.jus.br",
+})
+
+
+def hosts_protegidos(sistema_em_uso: str) -> frozenset[str]:
+    """
+    Endereços que a limpeza nunca fecha enquanto este sistema roda. Função pura
+    — ver test_runner.py.
+
+    Existe por causa de 02, 06 e 07/10/2026: durante o bloco do eProc, a aba do
+    PJe (e uma vez a do RUPE) trocou de id parada na fila, a limpeza a tomou por
+    aba vazada e fechou. Em 06/10 isso custou os 23 processos do PJe. Aba de
+    outro sistema nunca é lixo deste: só o sistema em uso abre abas.
+
+    O SSO do PJe é a exceção, só para o próprio PJe: abrir o PJe termina lá
+    (medido em 19/08), e é onde a aba vazada dele costuma parar.
+    """
+    meu_host = SISTEMA_HOST.get(sistema_em_uso, "")
+    outros = {h for s, h in SISTEMA_HOST.items() if s != sistema_em_uso and h != meu_host}
+    login = set(HOSTS_DE_LOGIN)
+    if sistema_em_uso == "pje_tjmg":
+        login.discard("sso.cloud.pje.jus.br")
+    return frozenset(outros | login)
+
+
+def _hostname(url: str | None) -> str:
+    try:
+        return urllib.parse.urlparse(url or "").hostname or ""
+    except Exception:
+        return ""
+
+
+def abas_vazadas(
+    abas_agora: list[dict],
+    ids_no_inicio: set[str],
+    sufixo: str = SUFIXO_JUDICIAL,
+    protegidos: frozenset[str] = frozenset(),
+) -> list[str]:
+    """
+    As abas que a extração abriu e ninguém fechou. Função pura — ver test_runner.py.
+
+    Medido nos logs de 18 e 19/08 na máquina do Rafael: o Chrome começou a
+    rodada com 5 abas e terminou o bloco do PJe com 46, cerca de uma aba a cada
+    dez documentos lidos. A partir daí toda rodada seguinte morria, porque a
+    conexão do Playwright precisa falar com cada aba antes de começar e estourava
+    os 180s. Chrome novo rodava inteiro; Chrome já usado, nunca.
+
+    Três travas para não fechar o que não é nosso:
+    - só o que apareceu DEPOIS do início (o login do operador estava lá antes);
+    - só `type == "page"` (iframe e service worker não se fecham por aqui);
+    - só endereço de tribunal (a pesquisa dele no Google fica em paz);
+    - nunca endereço de outro sistema ou tela de login (ver hosts_protegidos).
+    """
+    return [
+        aba.get("id", "")
+        for aba in abas_agora
+        if aba.get("type") == "page"
+        and aba.get("id") not in ids_no_inicio
+        and sufixo in (aba.get("url") or "")
+        and _hostname(aba.get("url")) not in protegidos
+        and aba.get("id")
+    ]
+
+
+def aba_de_trabalho(
+    abas_agora: list[dict],
+    candidatas: list[str],
+    host_em_uso: str,
+) -> str | None:
+    """
+    Qual das `candidatas` à limpeza é, na verdade, a aba de trabalho do sistema
+    em uso — e por isso não pode ser fechada. Função pura — ver test_runner.py.
+
+    Existe por causa de 11/09/2026, na máquina do Rafael. Depois do 5º processo
+    do eProc TJMG a limpeza fechou `eproc1g.tjmg.jus.br/...processo_selecionar`
+    — a página do próprio processo 5 — e o 6º já não achou aba nenhuma. O
+    extrator do eProc nunca abre aba: trabalha sempre na mesma. Então a aba
+    fechada era a de trabalho, com um id que o Chrome trocou no meio do bloco
+    (nos processos 1 a 4 a limpeza não tocou nela). Ninguém mexeu no Chrome, e
+    a aba do TRF6 foi para a mesma página sem trocar de id — a causa da troca
+    segue desconhecida. É, muito provavelmente, o sumiço de 09/09 também.
+
+    A trava não depende de saber a causa: se fechar as candidatas deixaria o
+    sistema em uso sem nenhuma aba, a primeira candidata desse host fica.
+    """
+    if not host_em_uso:
+        return None
+    fechar = set(candidatas)
+    sobra_alguma = any(
+        aba.get("type") == "page"
+        and host_em_uso in (aba.get("url") or "")
+        and aba.get("id") not in fechar
+        for aba in abas_agora
+    )
+    if sobra_alguma:
+        return None
+    for aba in abas_agora:
+        if aba.get("id") in fechar and host_em_uso in (aba.get("url") or ""):
+            return aba.get("id")
+    return None
+
+
+def descrever_abas(abas: list[dict], ids: list[str], limite: int = 8) -> str:
+    """
+    Os endereços das abas com estes ids. Função pura — ver test_runner.py.
+
+    Existe por causa de 09/09/2026. A limpeza escrevia só "1/1 aba(s)
+    fechada(s)" — quantas, nunca quais. Naquela rodada a aba do eProc sumiu do
+    Chrome dentro da mesma janela de tempo em que a limpeza rodou, e essa linha
+    não permitiu nem confirmar nem descartar que tinha sido ela: a investigação
+    parou ali, com a pergunta em aberto e nenhum caminho para respondê-la a não
+    ser esperar acontecer de novo.
+
+    Contar não serve para nada depois do fato. Dizer quais responde na hora.
+
+    Um id que sumiu entre a leitura e o fechamento vira texto explícito em vez
+    de desaparecer da lista: some da lista é indistinguível de nunca ter estado
+    nela, que é exatamente o tipo de silêncio que este projeto já pagou caro.
+    """
+    if not ids:
+        return "nenhuma"
+    por_id = {a.get("id"): (a.get("url") or "?") for a in abas}
+    urls = [por_id.get(i) or f"(id {i} sumiu antes do fechamento)" for i in ids]
+    mostradas = urls[:limite]
+    sobra = len(urls) - len(mostradas)
+    texto = " | ".join(mostradas)
+    return f"{texto} (+{sobra})" if sobra > 0 else texto
+
+
+def resumir_abas(abas: list[dict]) -> str:
+    """
+    "46 aba(s) (page 41, iframe 5)" — para o log dizer de que são as abas.
+
+    O total sozinho não basta: se um dia o número voltar a subir depois da
+    limpeza, saber se o que cresceu foi página ou iframe é a diferença entre ter
+    a resposta e abrir outra investigação. Função pura — ver test_runner.py.
+    """
+    if not abas:
+        return "0 aba(s)"
+    tipos: dict[str, int] = defaultdict(int)
+    for aba in abas:
+        tipos[str(aba.get("type") or "?")] += 1
+    detalhe = ", ".join(f"{t} {n}" for t, n in sorted(tipos.items()))
+    return f"{len(abas)} aba(s) ({detalhe})"
+
+
+def motivo_da_falta_de_sessao(erro: str, minutos_de_rodada: float) -> str:
+    """
+    Por que este sistema não tinha sessão. Função pura — ver test_runner.py.
+
+    Até 31/08 o código escrevia sempre "Login ainda não estava feito", com este
+    raciocínio: falhar já no primeiro processo é a assinatura de ninguém ter
+    logado. Isso era verdade quando a extração começava logo depois do login.
+    Deixou de ser quando o sistema é o terceiro da fila e a vez dele chega 40
+    minutos depois — aí falhar no primeiro significa o CONTRÁRIO: a sessão foi
+    feita e envelheceu esperando.
+
+    E a frase mandava o Rafael conferir justamente o que estava certo. Ele
+    perguntou por que "login não ativo" aparecia tanto sendo que ele sempre loga:
+    ele logava mesmo. Ver a ordem em PRIORIDADE_SISTEMAS, que é a outra metade
+    desta correção.
+
+    "Nenhuma aba" é um terceiro caso, e nada tem a ver com login: o sistema nem
+    chegou a ser aberto no Chrome.
+    """
+    if "Nenhuma aba" in erro:
+        return MOTIVO_SEM_ABA
+    if minutos_de_rodada >= LIMIAR_SESSAO_ENVELHECIDA_MIN:
+        return (
+            f"A sessão caiu esperando a vez: a extração só chegou neste sistema "
+            f"{round(minutos_de_rodada)} min depois de começar — refaça o login "
+            "dele e rode de novo"
+        )
+    return MOTIVO_LOGIN_PENDENTE
+
+
+def estado_de_previvo(abas: list[dict], sistema: str) -> tuple[bool, str]:
+    """
+    O que dá para saber deste sistema antes de começar. Função pura — ver
+    test_runner.py.
+
+    Devolve (tem_aba, frase). Só olha o endereço das abas: é barato (uma
+    chamada HTTP para a rodada inteira) e não depende do Playwright, que é
+    justamente o que trava quando o Chrome está ruim.
+
+    Para eProc e RUPE o endereço não distingue logado de deslogado — está em
+    SEM_DETECCAO_DE_LOGIN, e é fato conhecido, não limitação nova. Nesses casos
+    a frase diz "aba presente, login indeterminável por aqui" em vez de fingir
+    um veredito. Prometer certeza que não existe é como o painel dizia "Abri
+    eProc TJMG" sem ter conferido.
+    """
+    urls = [str(a.get("url") or "") for a in abas if a.get("type") == "page"]
+    host = SISTEMA_HOST.get(sistema, "")
+    minhas = [u for u in urls if host and host in u]
+    if not minhas:
+        return False, "SEM ABA deste sistema no Chrome"
+    if sistema in SEM_DETECCAO_DE_LOGIN:
+        return True, f"aba presente ({len(minhas)}); login não é detectável pelo endereço"
+    logada = any(_avaliar_login(u, sistema, tem_form_login=False) for u in minhas)
+    return True, (f"aba presente ({len(minhas)}) e com cara de logada" if logada
+                  else f"aba presente ({len(minhas)}), mas o endereço é de tela de login")
+
+
+def chrome_responde() -> bool:
+    """
+    O Chrome ainda atende no endereço de debug?
+
+    Checagem barata (urllib, 2s de teto) e independente do Playwright — é a mesma
+    que `abrir_sistemas` usa para saber se precisa subir o Chrome. Serve para
+    separar "o Chrome morreu" de "esta conexão específica falhou": em 17/08 uma
+    única falha de `connect_over_cdp` condenou 17 processos de dois sistemas que
+    nunca chegaram a ser tentados.
+    """
+    return bool(_get_abas_chrome())
+
+
+async def _registrar_sondagem(
+    momento: str,
+    abas: list[dict] | None = None,
+    sistema: str | None = None,
+    numero_cnj: str | None = None,
+) -> None:
+    """
+    Pergunta a cada aba se ela responde e grava o resultado. Nunca levanta exceção.
+
+    Existe por causa de 02/10 e 05/10/2026: nas duas, o Chrome trocou o id da
+    aba de trabalho e a conexão seguinte travou 180s com o Chrome vivo. Sondar
+    na troca de id e na falha diz QUAL aba ficou muda, e se o Chrome a tinha
+    descartado — ver chrome_saude.py.
+    """
+    try:
+        resultados = await chrome_saude.sondar_abas(
+            abas if abas is not None else _get_abas_chrome())
+        ok, frase = chrome_saude.resumir_sondagem(resultados)
+    except Exception as e:
+        resultados, ok, frase = [], False, f"sondagem falhou: {type(e).__name__}: {e}"
+    obs.registrar("abas.sondagem", ok=ok, sistema=sistema, numero_cnj=numero_cnj,
+                  detalhe=f"[{momento}] {frase}",
+                  dados={"momento": momento, "abas": resultados})
+
+
+async def _recuperar(sistema: str, numero_cnj: str, prefixo: str) -> dict:
+    """
+    Destrava a conexão e grava o que foi feito. Nunca levanta exceção.
+
+    Medido em 07/10 na máquina do Rafael: depois de o Chrome trocar o id da
+    aba do PJe, essa aba ficou muda e cada conexão nova travava 180s nela.
+    Medido em 08/10 num Chrome descartável: fechar a aba muda destrava na hora.
+    """
+    resultado = await chrome_saude.recuperar_conexao(
+        SISTEMA_HOST.get(sistema, ""), SISTEMA_URLS.get(sistema, ""))
+    partes = []
+    if resultado["fechadas"]:
+        partes.append(f"fechei aba(s) muda(s): {', '.join(resultado['fechadas'])}")
+    if resultado["abriu"]:
+        partes.append("abri aba nova do sistema")
+    frase = "; ".join(partes) or "nenhuma aba muda encontrada; tento de novo assim mesmo"
+    print(f"{prefixo} — conexão travou: {frase}")
+    obs.registrar("chrome.recuperacao", ok=resultado["agiu"], sistema=sistema,
+                  numero_cnj=numero_cnj, detalhe=frase, dados=resultado)
+    return resultado
+
+
+def _raiz_do_motivo(motivo: str) -> str:
+    """
+    A causa original de um motivo, sem as camadas de '(antes: ...)' empilhadas.
+    Função pura — ver test_runner.py.
+    """
+    if MARCA_ANTES not in motivo:
+        return motivo
+    return motivo.rsplit(MARCA_ANTES, 1)[1].rstrip(")")
+
+
+def motivo_devolucao(motivo_novo: str, motivo_anterior: str | None) -> str:
+    """
+    O que gravar em `motivo_ignorado` ao devolver um processo à fila. Função pura
+    — ver test_runner.py.
+
+    Devolver à fila sobrescrevia o motivo anterior, e como a fila já traz de volta
+    quem estava em `erro_browser`, o efeito era este: o Rafael clicava em
+    extrair, a rodada abortava, e o diagnóstico de ontem ("certificado digital")
+    era substituído por "o Chrome parou de responder". Em 17/08 ele perguntou por
+    que os erros tinham sumido — tinham sido apagados por esta linha.
+
+    Só a causa raiz é preservada: empilhar '(antes: (antes: ...))' a cada rodada
+    encheria os 400 caracteres do campo com o mesmo aviso repetido.
+    """
+    if not motivo_anterior:
+        return motivo_novo[:400]
+    raiz = _raiz_do_motivo(motivo_anterior).strip()
+    if not raiz or raiz == motivo_novo:
+        return motivo_novo[:400]
+    return f"{motivo_novo}{MARCA_ANTES}{raiz})"[:400]
+
+
+DESFECHO_ABORTAR_RODADA = "abortar_rodada"
+DESFECHO_ABANDONAR_SISTEMA = "abandonar_sistema"
+
+
+def decidir_desfecho_cdp(cdp_responde: bool) -> str:
+    """
+    O que fazer quando a conexão falhou mesmo depois de recuperar e tentar de
+    novo. Função pura — ver test_runner.py.
+
+    CDP mudo = o Chrome morreu: nenhum sistema seguinte tem chance, para tudo.
+    CDP respondendo = o Chrome está vivo e o problema é deste sistema: desiste
+    só dele e segue para o próximo. Até 08/10 a segunda falha parava a rodada
+    inteira, e como o PJe é o último, era sempre ele que ficava sem a vez: 81
+    dos 86 processos que o Rafael fez à mão entre 02 e 07/10.
+    """
+    return DESFECHO_ABORTAR_RODADA if not cdp_responde else DESFECHO_ABANDONAR_SISTEMA
+
+
+def motivo_do_erro(resultado: dict | None) -> str:
+    """
+    Mensagem real do extrator, para gravar em `motivo_ignorado`.
+    Sem isto o banco só guarda "Erro durante processamento" e o diagnóstico
+    depende de alguém estar olhando o terminal na hora em que falhou.
+    """
+    if not resultado:
+        return "Erro durante processamento (extrator não retornou resultado)"
+    erro = str(resultado.get("erro") or "desconhecido").strip()
+    detalhe = str(resultado.get("mensagem") or "").strip()
+    texto = f"{erro} — {detalhe}" if detalhe else erro
+    return texto[:400]
+
+
+# Do texto cru do erro para uma frase curta. A ordem importa: a primeira que
+# casar vence, então o específico vem antes do genérico.
+# Espelha as categorias do painel (app/dashboard/erros.ts) de propósito — as duas
+# pontas descrevem a mesma rodada e não podem discordar na frente do Rafael.
+CATEGORIAS_MOTIVO: list[tuple[str, str]] = [
+    ("certificado digital", "os processos exigem certificado digital"),
+    ("recusou o acesso", "o sistema recusou o acesso"),
+    ("não localizado", "os processos não foram encontrados"),
+    ("Tabela de eventos não encontrada", "os processos não foram encontrados"),
+    ("sem_documentos", "os processos não têm documento"),
+    ("não tem extrator", "não há extrator para esse tribunal"),
+    ("Sistema não implementado", "não há extrator para esse tribunal"),
+    # os dois específicos vêm antes dos genéricos: a sessão que envelheceu na
+    # fila e o sistema que nem foi aberto pedem ações diferentes de "refazer o
+    # login", e juntá-los foi o que escondeu 35 processos do eProc até 31/08.
+    ("sessão caiu esperando a vez", "a sessão envelheceu esperando a vez na fila"),
+    ("não estava aberto no Chrome", "o sistema não estava aberto"),
+    ("sessao_expirada", "a sessão caiu"),
+    ("Nenhuma aba", "o sistema não estava aberto"),
+    ("Chrome parou", "o Chrome não respondeu"),
+    ("supabase_falhou", "falha ao gravar no banco"),
+]
+
+
+def resumir_motivos(motivos: list[str]) -> str | None:
+    """
+    A categoria mais frequente entre os erros, em texto de gente. Função pura —
+    ver test_runner.py. `None` quando não há motivo reconhecível.
+
+    Serve para o agente parar de chutar "Login não concluído?" quando nenhum
+    processo é extraído: em 16/08 essa frase apareceu duas vezes com os erros
+    todos em certificado digital, ou seja, com o login perfeitamente feito.
+    """
+    contagem: dict[str, int] = defaultdict(int)
+    for motivo in motivos:
+        for marca, frase in CATEGORIAS_MOTIVO:
+            if marca in motivo:
+                contagem[frase] += 1
+                break
+    if not contagem:
+        return None
+    return max(contagem.items(), key=lambda par: par[1])[0]
+
+
+# Estado de quem o gestor assumiu na mão pelo painel: sai da fila do robô e a
+# edição passa a ser dele. A fila (ler_cnjs_supabase) já ignora este valor por
+# não estar na lista dela — este nome existe aqui só para a regra de reinserção
+# abaixo poder reconhecê-lo.
+STATUS_TRATADO_MANUAL = "tratado_manual"
+
+# Status de quem já está na fila ou saiu dela por decisão de gente. Reinserir
+# qualquer um destes é errado, por motivos diferentes: 'pendente' já está lá, e
+# 'tratado_manual' foi tirado de propósito.
+STATUS_QUE_NAO_VOLTAM_PARA_A_FILA = ("pendente", STATUS_TRATADO_MANUAL)
+
+
+# Quantos avisos de publicação ignorada ficam guardados por processo. Um por dia
+# de pauta, então dez é cerca de duas semanas — o bastante para o Rafael ver
+# que o processo continua se movendo, sem o campo crescer para sempre.
+AVISO_MAX_LINHAS = 10
+
+MARCA_AVISO = "Publicação nova em "
+
+
+def _data_da_pauta(lote_id: str | None) -> str:
+    """DD/MM/AAAA a partir do lote, que vem em qualquer um dos dois formatos."""
+    bruto = (lote_id or "").strip()
+    if re.fullmatch(r"\d{2}/\d{2}/\d{4}", bruto):
+        return bruto
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", bruto):
+        ano, mes, dia = bruto.split("-")
+        return f"{dia}/{mes}/{ano}"
+    return datetime.now(timezone.utc).astimezone().strftime("%d/%m/%Y")
+
+
+def aviso_publicacao_ignorada(lote_id: str | None, observacoes: str | None) -> str:
+    """
+    O texto de `observacoes` depois de registrar que chegou publicação nova num
+    processo que está sendo tratado na mão. Função pura — ver test_runner.py.
+
+    Sem isto o CNJ era simplesmente pulado e nada dizia que ele tinha chegado: o
+    processo continua andando no tribunal e o Rafael não fica sabendo, porque
+    ele saiu da fila de propósito. O campo já é exibido em três telas do painel
+    (a caixa de aviso da página do processo, a lista da entrada e o cartão do
+    dashboard), então escrever aqui basta — nada muda do outro lado.
+
+    Mais recente primeiro. A mesma pauta não entra duas vezes: uma rodada
+    reprocessada não pode virar dez linhas iguais.
+    """
+    linha = f"{MARCA_AVISO}{_data_da_pauta(lote_id)} — processo tratado na mão, não voltou para a fila."
+    anteriores = [l for l in (observacoes or "").splitlines() if l.strip()]
+    if linha in anteriores:
+        return "\n".join(anteriores)
+    # o limite vale só para os avisos: a anotação de quem trata o processo nunca sai
+    avisos = [l for l in anteriores if l.startswith(MARCA_AVISO)][: AVISO_MAX_LINHAS - 1]
+    anotacoes = [l for l in anteriores if not l.startswith(MARCA_AVISO)]
+    return "\n".join([linha] + avisos + anotacoes)
+
+
+def motivo_de_nao_reinserir(status_atual: str | None) -> str | None:
+    """
+    Por que este CNJ não deve voltar para a fila ao chegar de novo por e-mail.
+    `None` quando pode voltar. Função pura — ver test_runner.py.
+
+    Existe por causa do 'tratado_manual'. A reinserção grava `pje_status`
+    'pendente' por cima do que estava lá, então uma publicação nova de um
+    processo que o Rafael assumiu na mão desligaria o tratamento manual dele
+    sozinho, sem ninguém pedir e sem aviso nenhum no painel.
+    """
+    if status_atual == "pendente":
+        return "já está pendente"
+    if status_atual == STATUS_TRATADO_MANUAL:
+        return "está sendo tratado na mão pelo gestor"
+    return None
+
+
+def inserir_processos_pendentes(
+    entradas: list[dict],
+    fonte: str = "manual",
+    lote_id: str | None = None,
+) -> None:
+    """
+    Insere CNJs pendentes diretamente em `processos`.
+    Cada entrada pode ter: numero_cnj, vara, comarca, polo_ativo, polo_passivo, classe_processual.
+    """
+    _carregar_env()
+    client = _get_client()
+
+    # a linha inteira, e não só o status: quem está sendo tratado na mão recebe um
+    # aviso em `observacoes`, e para isso é preciso saber o que já está escrito lá
+    res_existentes = (
+        client.table("processos").select("numero_cnj, pje_status, observacoes").execute()
+    )
+    existentes: dict[str, dict] = {
+        r["numero_cnj"]: r for r in (res_existentes.data or [])
+    }
+
+    vistos: set[str] = set()
+    inseridos = 0
+    ignorados = 0
+
+    for entrada in entradas:
+        cnj = entrada.get("numero_cnj", "").strip()
+        if not cnj:
+            continue
+
+        linha_atual = existentes.get(cnj) or {}
+        status_atual = linha_atual.get("pje_status")
+
+        motivo_pular = motivo_de_nao_reinserir(status_atual)
+        if motivo_pular:
+            print(f"  CNJ {cnj} {motivo_pular} — ignorando reinserção")
+            # Tratado na mão sai da fila, mas o processo continua andando no
+            # tribunal. Sem este registro o Rafael não teria como saber que
+            # chegou publicação nova — ele deixou de acompanhar pelo painel de
+            # pendências justamente por ter assumido o processo.
+            if status_atual == STATUS_TRATADO_MANUAL:
+                client.table("processos").update({
+                    "observacoes": aviso_publicacao_ignorada(
+                        lote_id, linha_atual.get("observacoes")
+                    )
+                }).eq("numero_cnj", cnj).execute()
+            continue
+
+        duplicata = cnj in vistos
+        if not duplicata and status_atual in ("processado", "ignorado", "erro_browser", "captcha_bloqueado"):
+            duplicata = True
+
+        motivo = ("CNJ duplicado no mesmo lote" if cnj in vistos
+                  else "CNJ já existe em processos" if duplicata else None)
+        vistos.add(cnj)
+
+        row: dict = {
+            "numero_cnj": cnj,
+            "fonte": fonte,
+            "lote_id": lote_id,
+            "duplicata": duplicata,
+            "pje_status": "ignorado" if duplicata else "pendente",
+            "data_entrada": datetime.now(timezone.utc).isoformat(),
+        }
+        if motivo:
+            row["motivo_ignorado"] = motivo
+
+        # campos de cabeçalho extraídos do e-mail — só preenche se presentes
+        for campo in ("vara", "comarca", "polo_ativo", "polo_passivo", "classe_processual"):
+            if entrada.get(campo):
+                row[campo] = entrada[campo]
+
+        if duplicata or status_atual is None:
+            client.table("processos").upsert(row, on_conflict="numero_cnj").execute()
+        else:
+            # processo já existe mas não está pendente — apenas atualiza campos de entrada
+            update = {k: v for k, v in row.items() if k != "numero_cnj"}
+            client.table("processos").update(update).eq("numero_cnj", cnj).execute()
+
+        if duplicata:
+            ignorados += 1
+        else:
+            inseridos += 1
+
+    print(f"  {inseridos} CNJ(s) pendentes, {ignorados} duplicata(s) ignorada(s)")
+
+
+# ── processamento de um único CNJ ────────────────────────────────
+
+async def processar_cnj(
+    info: CNJInfo,
+    data_str: str,
+    prefixo: str,
+    data_corte: str | None = None,
+) -> dict | None:
+    """
+    Extrai e analisa um CNJ, cronometrado.
+
+    Mede todas as tentativas, inclusive as que falham: tempo gasto num processo que
+    deu erro é tempo real. Quais entram na média é decisão da interface, não daqui.
+    """
+    inicio = time.monotonic()
+    resultado = await _extrair_e_analisar(info, data_str, prefixo, data_corte=data_corte)
+    if isinstance(resultado, dict):
+        resultado["duracao_extracao_s"] = duracao_segundos(inicio, time.monotonic())
+    return resultado
+
+
+async def _extrair_e_analisar(
+    info: CNJInfo,
+    data_str: str,
+    prefixo: str,
+    data_corte: str | None = None,
+) -> dict | None:
+    extrator = obter_extrator(info.sistema)
+    if not extrator:
+        return None  # não deve chegar aqui — filtrado antes
+
+    MAX_TENTATIVAS = 3
+    resultado = None
+
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        sufixo = f" (tentativa {tentativa}/{MAX_TENTATIVAS})" if tentativa > 1 else ""
+        if data_corte:
+            print(f"{prefixo} — extraindo (a partir de {data_corte[:10]}){sufixo}...")
+        else:
+            print(f"{prefixo} — extraindo (todos os documentos){sufixo}...")
+
+        try:
+            resultado = await extrator(info.numero_cnj, data_corte=data_corte, sistema_hint=info.sistema)
+        except Exception as e:
+            resultado = {"erro": str(e), "numero_cnj": info.numero_cnj}
+
+        if resultado.get("erro"):
+            erro_msg = resultado["erro"]
+            # recusa de acesso não muda por insistência — retentar só repete o alerta
+            _permanente = ("sessao_expirada", "Nenhuma aba", "Não foi possível conectar",
+                           "recusou o acesso")
+            eh_permanente = any(p in erro_msg for p in _permanente)
+            if eh_permanente or tentativa == MAX_TENTATIVAS:
+                print(f"{prefixo} — ERRO extração: {erro_msg}")
+                return resultado
+            print(f"{prefixo} — ERRO temporário ({erro_msg}) — retentando em 10s...")
+            await asyncio.sleep(10)
+            continue
+
+        total = resultado.get("total_documentos", 0)
+        print(f"{prefixo} — {total} doc(s)")
+
+        if total > 0:
+            break
+
+        if eh_nada_novo(total, data_corte):
+            break  # retentar não traz documento que não existe
+
+        if tentativa < MAX_TENTATIVAS:
+            print(f"{prefixo} — 0 documentos, retentando em 5s...")
+            await asyncio.sleep(5)
+
+    if resultado.get("total_documentos", 0) == 0:
+        if eh_nada_novo(0, data_corte):
+            print(f"{prefixo} — nada novo desde {data_corte[:10]} — segue processado")
+            return {"nada_novo": True, "numero_cnj": info.numero_cnj}
+        print(f"{prefixo} — ERRO: nenhum documento após {MAX_TENTATIVAS} tentativa(s)")
+        return {"erro": "sem_documentos", "numero_cnj": info.numero_cnj}
+
+    print(f"{prefixo} — analisando com Claude...")
+    analise = analisar_processo(info.numero_cnj, resultado)
+
+    motivo_revisao: str | None = None
+    if analise.get("erro"):
+        # análise falhou (ex: sem créditos API) — salva os documentos mesmo assim
+        print(f"{prefixo} — AVISO análise: {analise['erro']} — salvando documentos sem análise")
+        motivo_revisao = f"ANÁLISE NÃO GERADA ({analise['erro']}) — revisar manualmente"[:400]
+        analise = {}  # rascunho vazio; pje_status ficará 'processado' sem análise
+
+    if not analise.get("erro"):
+        status    = analise.get("status_sugerido", "?")
+        resp      = analise.get("responsavel_sugerido", "?")
+        prazo     = analise.get("prazo_fatal_dias_uteis")
+        risco     = analise.get("classificacao_risco", "?")
+        prazo_str = f"{prazo} d.u." if prazo else "sem prazo"
+        print(f"{prefixo} — {status} | {resp} | {prazo_str} | {risco}")
+
+    n_docs = len(resultado.get("documentos") or [])
+    print(f"{prefixo} — salvando {n_docs} doc(s) no Supabase...")
+    sb = salvar_no_supabase(info.numero_cnj, resultado, analise)
+    if sb.get("ok"):
+        print(f"{prefixo} — salvo OK (id: {sb['processo_id'][:8]}...)")
+    else:
+        print(f"{prefixo} — ERRO Supabase: {sb.get('erro')}")
+        print(sb.get("tb", "(sem traceback)"))
+        # a exceção real vai junto: em 17/08 o banco guardou só "supabase_falhou"
+        # e não deu para saber se foi rede, SSL ou dado inválido.
+        return {"erro": "supabase_falhou", "numero_cnj": info.numero_cnj,
+                "mensagem": str(sb.get("erro") or "")[:200]}
+
+    if motivo_revisao:
+        # sem este aviso o processo fica 'processado' e some do painel sem prazo
+        # nenhum — o pior desfecho num sistema de controle de prazo, porque
+        # ninguém vai olhar de novo um processo que aparece como pronto.
+        resultado["revisao_manual"] = motivo_revisao
+
+    return resultado
+
+
+# ── orquestração por sistema ──────────────────────────────────────
+
+async def processar_por_sistema(
+    cnjs_roteados: list[CNJInfo],
+    data_str: str,
+    ids_map: dict[str, str] | None = None,
+    corte_map: dict[str, str | None] | None = None,
+    modo: str = MODO_INTERATIVO,
+    motivos_anteriores: dict[str, str | None] | None = None,
+) -> tuple[list[str], list[str], list[tuple[str, str]], list[str], list[str], set[str]]:
+    """
+    Agrupa os CNJs por sistema, autentica uma vez, processa um sistema por vez.
+    Retorna (ids_ok, ids_erro, ids_revisao, ids_nada_novo, motivos_erro, devolvidos).
+    `motivos_erro`  é o texto cru de cada falha, para o agente dizer a causa real.
+    `ids_revisao`   são processos salvos porém sem análise — precisam de aviso.
+    `ids_nada_novo` já estavam extraídos e não tinham documento novo — continuam
+    processados, mas não devem ser contados como extração desta rodada.
+    `devolvidos`    voltaram para 'pendente' sem terem sido tentados. Não são erro
+    e não são sucesso: é trabalho que ficou para a próxima rodada, e some do
+    resumo se ninguém contar (ver `_resumo_para_status` no agente).
+    `motivos_anteriores` é o `motivo_ignorado` que cada CNJ já tinha, para que
+    devolver à fila não apague o diagnóstico da rodada passada.
+    """
+
+    # separar por sistema
+    por_sistema: dict[str, list[CNJInfo]] = defaultdict(list)
+    nao_impl: list[CNJInfo] = []
+    com_erro: list[CNJInfo] = []
+
+    for info in cnjs_roteados:
+        if info.erro:
+            com_erro.append(info)
+        elif not esta_implementado(info.sistema):
+            nao_impl.append(info)
+        else:
+            por_sistema[info.sistema].append(info)
+
+    # avisar sistemas não implementados
+    if nao_impl:
+        print("Sistemas ainda não implementados (serão pulados):")
+        by_sis: dict[str, int] = defaultdict(int)
+        for info in nao_impl:
+            by_sis[info.sistema] += 1
+        for sis, qtd in by_sis.items():
+            print(f"  {sis} ({descricao_pendente(sis)}) — {qtd} CNJ(s)")
+        print()
+
+    if com_erro:
+        print(f"CNJs com formato inválido: {len(com_erro)}")
+        for info in com_erro:
+            print(f"  {info.numero_cnj} — {info.erro}")
+        print()
+
+    if not por_sistema:
+        print("Nenhum CNJ para processar.")
+        return [], [], [], [], [], set()
+
+    sistemas_necessarios = ordenar_sistemas(list(por_sistema.keys()))
+    ids_ok: list[str] = []
+    ids_erro: list[str] = []
+    ids_revisao: list[tuple[str, str]] = []
+    ids_nada_novo: list[str] = []
+    # texto cru de cada falha, para o agente poder dizer o motivo real em vez de
+    # chutar "login não concluído" — ver resumir_motivos
+    motivos_erro: list[str] = []
+
+    # o Chrome travado não se recupera sozinho: uma vez detectado, nenhum sistema
+    # seguinte tem chance. A flag para a rodada inteira, não só o sistema atual.
+    chrome_morreu = False
+    rodada_encerrada = False
+    # Quando a rodada começou. Serve para saber se uma sessão que faltou nunca
+    # existiu ou envelheceu esperando — ver motivo_da_falta_de_sessao — e para o
+    # log registrar em que minuto cada sistema pegou a vez, que é o dado que
+    # falta para saber quanto dura a sessão de cada tribunal.
+    inicio_rodada = time.monotonic()
+    # quem voltou para a fila sem ser tentado — set porque o mesmo CNJ pode ser
+    # devolvido por dois caminhos (fila do sistema e timeout de login)
+    devolvidos: set[str] = set()
+    anteriores = motivos_anteriores or {}
+
+    def _devolver_a_fila(restantes: list[CNJInfo], motivo: str) -> None:
+        alvos = [o.numero_cnj for o in restantes
+                 if ids_map and o.numero_cnj in ids_map]
+        if alvos:
+            print(f"  {len(alvos)} CNJ(s) devolvidos à fila")
+
+        # agrupado por motivo final para não fazer um UPDATE por processo: quase
+        # todos compartilham o mesmo motivo anterior, então costuma dar 1 ou 2.
+        por_motivo: dict[str, list[str]] = defaultdict(list)
+        for cnj in alvos:
+            cnj_id = ids_map[cnj]
+            devolvidos.add(cnj_id)
+            por_motivo[motivo_devolucao(motivo, anteriores.get(cnj))].append(cnj_id)
+        for texto, ids in por_motivo.items():
+            marcar_supabase(ids, "pendente", texto)
+
+    async def _processar_sistema(sistema: str) -> bool:
+        """
+        Processa a fila de um sistema. Devolve False quando não havia sessão logo
+        no PRIMEIRO processo — sinal de que ninguém logou ainda e vale tentar de
+        novo mais tarde. Todo o resto devolve True: o sistema está resolvido para
+        esta rodada, mesmo que tenha dado erro.
+        """
+        nonlocal chrome_morreu, rodada_encerrada
+        infos = por_sistema[sistema]
+        total = len(infos)
+
+        if rodada_encerrada:
+            return True
+
+        if chrome_morreu:
+            print(f"[{sistema}] pulado — o Chrome não está respondendo")
+            _devolver_a_fila(infos, MOTIVO_CHROME)
+            return True
+
+        print(f"{'='*50}")
+        # Sem aba deste sistema, abre uma: o login mora nos cookies, não na aba.
+        # Em 06/10 a aba do PJe tinha sido fechada no meio da rodada e os 23
+        # processos voltaram à fila com "o sistema não estava aberto".
+        host, url = SISTEMA_HOST.get(sistema, ""), SISTEMA_URLS.get(sistema, "")
+        if await chrome_saude.garantir_aba(host, url):
+            print(f"[{sistema}] não havia aba deste sistema — abri uma nova")
+            obs.registrar("abas.reaberta", ok=True, sistema=sistema,
+                          detalhe=f"não havia aba de {host} no início do bloco; abri {url}")
+        # As abas de agora são a régua da limpeza: tudo o que existir a partir
+        # daqui e for de sistema judicial foi a extração que abriu. Ver
+        # abas_vazadas para as travas.
+        abas_no_inicio = _get_abas_chrome()
+        ids_no_inicio = {a.get("id") for a in abas_no_inicio}
+        minutos = (time.monotonic() - inicio_rodada) / 60
+        print(f"[{sistema}] {total} CNJ(s) — {resumir_abas(abas_no_inicio)} no Chrome "
+              f"— minuto {minutos:.0f} da rodada\n")
+        tem_aba, frase_aba = estado_de_previvo(abas_no_inicio, sistema)
+        obs.registrar("sistema.inicio", ok=tem_aba, sistema=sistema,
+                      detalhe=f"{total} CNJ(s), minuto {minutos:.0f} da rodada — {frase_aba}",
+                      dados={"cnjs": total, "minuto_da_rodada": round(minutos, 1),
+                             "abas_no_chrome": len(abas_no_inicio), "tem_aba": tem_aba})
+        for i, info in enumerate(infos, 1):
+            prefixo = f"  [{i}/{total}] {info.numero_cnj}"
+            if rodada_foi_encerrada():
+                rodada_encerrada = True
+                obs.registrar("rodada.encerrada_fora", ok=False, sistema=sistema,
+                              numero_cnj=info.numero_cnj,
+                              detalhe="a etiqueta da rodada não está mais 'em andamento' "
+                                      "(foi dada como interrompida) — parei sem mexer na fila")
+                print(f"  [{sistema}] esta rodada foi encerrada por fora — parando aqui")
+                break
+            data_corte = corte_map.get(info.numero_cnj) if corte_map else None
+            resultado = await processar_cnj(info, data_str, prefixo, data_corte=data_corte)
+            if eh_chrome_inacessivel(resultado) and chrome_responde():
+                # Chrome vivo e conexão travada: quase sempre uma aba muda. Fecha
+                # as mudas, garante a aba deste sistema e tenta o mesmo processo
+                # de novo — ver chrome_saude.recuperar_conexao.
+                await _recuperar(sistema, info.numero_cnj, prefixo)
+                resultado = await processar_cnj(info, data_str, prefixo, data_corte=data_corte)
+            cnj_id = ids_map.get(info.numero_cnj) if ids_map else None
+
+            erro_do_cnj = str((resultado or {}).get("erro") or "")
+            abas_agora = _get_abas_chrome()
+            obs.registrar(
+                "cnj.fim", ok=not erro_do_cnj, sistema=sistema,
+                numero_cnj=info.numero_cnj,
+                detalhe=(erro_do_cnj or
+                         f"{(resultado or {}).get('total_documentos', 0)} documento(s)"),
+                dados={"posicao": i, "de": total,
+                       "duracao_s": (resultado or {}).get("duracao_extracao_s"),
+                       "abas": chrome_saude.retrato_abas(abas_agora)},
+            )
+            # A foto do ambiente no instante da falha. É a linha que faltou em
+            # 08/09: sem ela, "Nenhuma aba do eProc" não diz se a aba nunca
+            # existiu ou se sumiu no caminho, e a diferença muda o conserto.
+            if erro_do_cnj:
+                obs.registrar("cnj.ambiente", ok=False, sistema=sistema,
+                              numero_cnj=info.numero_cnj,
+                              detalhe=f"abertas no Chrome agora: "
+                                      f"{obs.resumir_urls(abas_agora)}")
+
+            # Limpa as abas que este processo deixou para trás, ANTES de qualquer
+            # desvio abaixo: um processo que deu erro também abriu aba, e sair
+            # pelo `break` sem limpar deixaria o lixo justamente na rodada que
+            # travou. Uma aba a cada dez documentos, e o Chrome do Rafael
+            # chegou a 46 numa rodada só — ver abas_vazadas.
+            vazadas = abas_vazadas(abas_agora, ids_no_inicio,
+                                   protegidos=hosts_protegidos(sistema))
+            poupada = aba_de_trabalho(abas_agora, vazadas, SISTEMA_HOST.get(sistema, ""))
+            if poupada:
+                vazadas = [tid for tid in vazadas if tid != poupada]
+                # Entra na régua: vira a aba de trabalho oficial do bloco, e a
+                # próxima limpeza já não a considera candidata.
+                ids_no_inicio.add(poupada)
+                print(f"{prefixo} — aba de trabalho mantida (o Chrome trocou o id dela)")
+                obs.registrar(
+                    "abas.poupada", ok=True, sistema=sistema, numero_cnj=info.numero_cnj,
+                    detalhe=f"mantida: {descrever_abas(abas_agora, [poupada])}",
+                    dados={"id_novo": poupada,
+                           "ids_do_inicio": sorted(i for i in ids_no_inicio if i != poupada)},
+                )
+                # nas duas vezes em que isto aconteceu (02/10 e 05/10) a conexão
+                # seguinte travou — ver _registrar_sondagem
+                await _registrar_sondagem("troca de id", abas_agora, sistema, info.numero_cnj)
+            if vazadas:
+                fechadas = [tid for tid in vazadas if fechar_aba_cdp(tid)]
+                print(f"{prefixo} — {len(fechadas)}/{len(vazadas)} aba(s) fechada(s)")
+                # QUAIS, não quantas: ver descrever_abas. Sem esta linha, a
+                # limpeza é o único ponto do projeto que fecha aba e o único que
+                # não deixa rastro do que fechou — e foi exatamente a suspeita
+                # que não deu para confirmar nem descartar em 09/09.
+                obs.registrar(
+                    "abas.limpeza", ok=len(fechadas) == len(vazadas),
+                    sistema=sistema, numero_cnj=info.numero_cnj,
+                    detalhe=f"fechadas: {descrever_abas(abas_agora, fechadas)}",
+                    dados={"pedidas": len(vazadas), "fechadas": len(fechadas),
+                           "protegidas": len(ids_no_inicio), "ids_fechados": fechadas},
+                )
+
+            # antes das checagens abaixo de propósito: tentativa que morreu no meio
+            # também consumiu tempo. A próxima tentativa sobrescreve o valor.
+            if cnj_id and isinstance(resultado, dict) and "duracao_extracao_s" in resultado:
+                gravar_duracao(cnj_id, resultado["duracao_extracao_s"])
+
+            if eh_chrome_inacessivel(resultado):
+                # com o Chrome vivo, já houve recuperação e nova tentativa acima
+                cdp_ok = chrome_responde()
+                obs.registrar("cnj.falha_cdp", ok=False, sistema=sistema,
+                              numero_cnj=info.numero_cnj,
+                              detalhe=("a conexão falhou de novo depois da recuperação; "
+                                       if cdp_ok else "a conexão falhou; ") +
+                                      f"o Chrome {'respondeu' if cdp_ok else 'NÃO respondeu'} "
+                                      "ao ping simples",
+                              dados={"cdp_responde": cdp_ok})
+                if decidir_desfecho_cdp(cdp_ok) == DESFECHO_ABORTAR_RODADA:
+                    chrome_morreu = True
+                    obs.registrar("rodada.abortada", ok=False, sistema=sistema,
+                                  detalhe="Chrome parou de responder — todos os sistemas "
+                                          "seguintes voltam para a fila sem serem tentados")
+                    print(f"  [{sistema}] o Chrome parou de responder — abortando a rodada")
+                    print(f"  >>> {MOTIVO_CHROME}")
+                    _devolver_a_fila(infos[i - 1:], MOTIVO_CHROME)
+                    break
+                obs.registrar("sistema.abandonado", ok=False, sistema=sistema,
+                              numero_cnj=info.numero_cnj,
+                              detalhe=f"a aba travou e não destravou — "
+                                      f"{total - i + 1} de volta à fila; a rodada segue "
+                                      "para o próximo sistema",
+                              dados={"devolvidos": total - i + 1})
+                print(f"  [{sistema}] travou e não destravou — seguindo para o próximo sistema")
+                _devolver_a_fila(infos[i - 1:], MOTIVO_SISTEMA_TRAVOU)
+                break
+
+            if eh_queda_de_sessao(resultado):
+                # seguir a fila só queima os CNJs restantes contra um sistema
+                # deslogado — em 29/07 foram 37 assim, em 1h40. O que não chegou
+                # a ser tentado volta para 'pendente': não é erro, é fila.
+                if i == 1:
+                    # Falhar já no primeiro processo é "não havia sessão" — mas
+                    # o porquê depende de quando a vez deste sistema chegou. Ver
+                    # motivo_da_falta_de_sessao: até 31/08 escrevia-se sempre
+                    # "login não estava feito", inclusive quando o login estava
+                    # perfeito e tinha só envelhecido na fila.
+                    motivo = motivo_da_falta_de_sessao(
+                        str((resultado or {}).get("erro") or ""),
+                        (time.monotonic() - inicio_rodada) / 60,
+                    )
+                    print(f"  [{sistema}] sem sessão — {motivo}")
+                    obs.registrar("sistema.sem_sessao", ok=False, sistema=sistema,
+                                  numero_cnj=info.numero_cnj,
+                                  detalhe=f"falhou já no primeiro processo. Motivo gravado: "
+                                          f"{motivo}",
+                                  dados={"minuto_da_rodada":
+                                         round((time.monotonic() - inicio_rodada) / 60, 1),
+                                         "devolvidos": len(infos),
+                                         "erro_bruto": erro_do_cnj[:300]})
+                    _devolver_a_fila(infos, motivo)
+                    return False
+                print(f"  [{sistema}] sessão caiu — devolvendo o resto da fila")
+                _devolver_a_fila(infos[i - 1:], MOTIVO_SESSAO)
+                break
+
+            if resultado and not resultado.get("erro") and cnj_id:
+                ids_ok.append(cnj_id)
+                if resultado.get("nada_novo"):
+                    ids_nada_novo.append(cnj_id)
+                if resultado.get("revisao_manual"):
+                    ids_revisao.append((cnj_id, resultado["revisao_manual"]))
+            elif cnj_id:
+                ids_erro.append(cnj_id)
+                motivo = motivo_do_erro(resultado)
+                motivos_erro.append(motivo)
+                marcar_supabase([cnj_id], "erro_browser", motivo)
+        obs.registrar("sistema.fim", sistema=sistema,
+                      detalhe=f"terminou no minuto "
+                              f"{(time.monotonic() - inicio_rodada) / 60:.0f} da rodada")
+        print()
+        return True
+
+    if modo == MODO_AUTO:
+        processados = await monitorar_logins_e_processar(sistemas_necessarios, _processar_sistema)
+        nao_processados = [s for s in sistemas_necessarios if s not in processados]
+        if ids_map and nao_processados:
+            ids_timeout = [
+                ids_map[info.numero_cnj]
+                for s in nao_processados
+                for info in por_sistema.get(s, [])
+                if info.numero_cnj in ids_map
+            ]
+            # login não concluído = não houve extração. Marcar erro aqui fazia
+            # o painel acusar falha em processo que nunca chegou a ser lido.
+            devolvidos.update(ids_timeout)
+            marcar_supabase(
+                ids_timeout, "pendente",
+                "Login não concluído dentro do tempo — nenhuma sessão ativa nas tentativas",
+            )
+    elif modo == MODO_ASSUMIR_LOGADO:
+        # O login foi feito antes, por outro comando, com o tempo que precisasse.
+        # Não existe máquina de retentativa aqui de propósito: se ainda faltar
+        # sessão, o primeiro CNJ de cada sistema falha e _processar_sistema
+        # devolve a fila inteira para 'pendente' sem queimar processo nenhum.
+        print(f"Extraindo direto (logins já feitos): {', '.join(sistemas_necessarios)}\n")
+        for sistema in sistemas_necessarios:
+            await _processar_sistema(sistema)
+    elif modo == MODO_INTERATIVO:
+        ok = await preparar_autenticacao(sistemas_necessarios, modo_auto=False)
+        if not ok:
+            return [], [], [], [], [], set()
+        for sistema in sistemas_necessarios:
+            await _processar_sistema(sistema)
+    else:
+        # Cair no interativo por engano seria pior do que estourar: ele chama
+        # input(), e o agente não tem terminal — ficaria pendurado até alguém
+        # notar que a rodada nunca termina.
+        raise ValueError(f"Modo desconhecido: {modo!r} (esperado um de {MODOS})")
+
+    # ids de CNJs não implementados → ignorado, com a mensagem daquele tribunal
+    # (uma chamada por processo, e não em bloco: o texto do TRF1 carrega a origem
+    # dele — ver cnj_router.motivo_sem_extrator)
+    if ids_map:
+        for info in nao_impl:
+            cnj_id = ids_map.get(info.numero_cnj)
+            if cnj_id:
+                motivo = motivo_sem_extrator(info.numero_cnj)
+                motivos_erro.append(motivo)
+                marcar_supabase([cnj_id], "ignorado", motivo)
+
+    # um CNJ devolvido à fila que depois foi extraído numa retentativa (MODO_AUTO)
+    # não está mais na fila — contá-lo faria o painel dizer que sobrou trabalho
+    # que na verdade foi feito.
+    devolvidos -= set(ids_ok) | set(ids_erro)
+
+    return ids_ok, ids_erro, ids_revisao, ids_nada_novo, motivos_erro, devolvidos
+
+
+# ── modos de execução ─────────────────────────────────────────────
+
+async def modo_supabase(modo: str = MODO_INTERATIVO) -> dict:
+    """Processa os pendentes do Supabase. Retorna resumo {total, processados, erros}."""
+    pendentes = ler_cnjs_supabase()
+    if not pendentes:
+        print("Nenhum CNJ pendente no Supabase.")
+        return {"total": 0, "processados": 0, "erros": 0}
+
+    numeros = [p["numero_cnj"] for p in pendentes]
+    ids_map = {p["numero_cnj"]: p["id"] for p in pendentes}
+    # só extrai incremental quem realmente tem os documentos anteriores salvos
+    com_docs = ids_com_documentos([p["id"] for p in pendentes])
+    corte_map = {
+        p["numero_cnj"]: (p.get("data_ultima_consulta") if p["id"] in com_docs else None)
+        for p in pendentes
+    }
+    hints = {p["numero_cnj"]: p.get("sistema") for p in pendentes}
+    # o que cada um já trazia escrito, para devolver à fila sem apagar o motivo
+    motivos_anteriores = {p["numero_cnj"]: p.get("motivo_ignorado") for p in pendentes}
+    cnjs = rotear_lista(numeros, hints)
+    data_str = str(date.today())
+
+    print(f"Supabase: {len(cnjs)} CNJ(s) únicos pendentes")
+
+    # Pré-voo: o estado de cada sistema ANTES de processar qualquer coisa.
+    # Custa uma chamada HTTP e responde, no minuto zero, a pergunta que em
+    # 08/09 só apareceu no minuto 26 — quando a vez do eProc TJMG chegou e não
+    # havia aba. Não decide nada e não aborta nada de propósito: mudar
+    # comportamento e ganhar visibilidade na mesma mexida esconderia qual das
+    # duas causou o resultado seguinte.
+    sistemas_da_fila = ordenar_sistemas(sorted({c.sistema for c in cnjs}))
+    abas_previvo = _get_abas_chrome()
+    obs.registrar("previvo.inicio",
+                  detalhe=f"{len(cnjs)} CNJ(s); ordem: {', '.join(sistemas_da_fila)}; "
+                          f"abertas: {obs.resumir_urls(abas_previvo)}",
+                  dados={"cnjs": len(cnjs), "ordem": sistemas_da_fila})
+    for sistema in sistemas_da_fila:
+        tem_aba, frase = estado_de_previvo(abas_previvo, sistema)
+        obs.registrar("previvo.sistema", ok=tem_aba, sistema=sistema, detalhe=frase,
+                      dados={"tem_aba": tem_aba})
+    # A régua de comparação para as sondagens do meio da rodada: se uma aba
+    # aparecer descartada depois, dá para saber se já começou assim.
+    desempenho = chrome_saude.ler_config_chrome()
+    versao = chrome_saude.versao_do_chrome()
+    obs.registrar("chrome.config", detalhe=chrome_saude.descrever_config(desempenho, versao),
+                  dados={"versao": versao, "desempenho": desempenho})
+    await _registrar_sondagem("previvo", abas_previvo)
+
+    ids_ok, ids_erro, ids_revisao, ids_nada_novo, motivos_erro, devolvidos = (
+        await processar_por_sistema(
+            cnjs, data_str, ids_map, corte_map, modo=modo,
+            motivos_anteriores=motivos_anteriores,
+        )
+    )
+    print(f"ids_ok={ids_ok}")
+    print(f"ids_erro={ids_erro}")
+    marcar_supabase(ids_ok, "processado")
+    # depois de marcar 'processado' (que limpa motivo_ignorado), reescreve o aviso
+    # nos que ficaram sem análise — senão eles aparecem no painel como prontos.
+    for cnj_id, motivo in ids_revisao:
+        marcar_supabase([cnj_id], "processado", motivo)
+    # os ids com erro já foram marcados um a um, com o motivo real, dentro de
+    # _processar_sistema — remarcar em bloco aqui sobrescreveria esse detalhe.
+    # "extraído" e "nada novo" contam como sucesso, mas dizer que 12 foram
+    # processados quando 9 só foram reconferidos confunde quem lê o painel.
+    extraidos = len(ids_ok) - len(ids_nada_novo)
+    aviso = f", {len(ids_revisao)} sem análise (revisão manual)" if ids_revisao else ""
+    sem_novidade = f", {len(ids_nada_novo)} sem novidade" if ids_nada_novo else ""
+    na_fila = f", {len(devolvidos)} de volta na fila" if devolvidos else ""
+    print(f"Concluído: {extraidos} processados{sem_novidade}, "
+          f"{len(ids_erro)} com erro{na_fila}{aviso}")
+    obs.registrar("extrair.fim", ok=bool(extraidos) or not ids_erro,
+                  detalhe=f"{extraidos} processado(s), {len(ids_erro)} com erro, "
+                          f"{len(devolvidos)} de volta na fila",
+                  dados={"total": len(cnjs), "processados": extraidos,
+                         "erros": len(ids_erro), "devolvidos": len(devolvidos),
+                         "sem_novidade": len(ids_nada_novo),
+                         "revisao_manual": len(ids_revisao)})
+    return {"total": len(cnjs), "processados": extraidos, "erros": len(ids_erro),
+            "revisao_manual": len(ids_revisao), "nada_novo": len(ids_nada_novo),
+            "devolvidos": len(devolvidos),
+            "motivo_principal": resumir_motivos(motivos_erro)}
+
+
+async def modo_local(data_str: str) -> None:
+    linhas = ler_cnjs_local(data_str)
+    if not linhas:
+        print(f"Nenhum CNJ em inputs/{data_str}/cnj_list.txt")
+        return
+    cnjs = rotear_lista(linhas)
+    print(f"Local [{data_str}]: {len(cnjs)} CNJ(s) únicos")
+    await processar_por_sistema(cnjs, data_str)
+
+
+async def main() -> None:
+    args = sys.argv[1:]
+
+    if "--todas" in args:
+        for d in datas_pendentes_local():
+            await modo_local(d)
+    elif "--local" in args:
+        args.remove("--local")
+        await modo_local(args[0] if args else str(date.today()))
+    else:
+        await modo_supabase()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

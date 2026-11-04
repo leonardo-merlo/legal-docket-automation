@@ -1,0 +1,565 @@
+# Aprendizados
+
+Registro do que a gente descobre investigando incidentes reais — não é plano,
+não é dívida técnica (isso fica em `divida-tecnica.md`), é "isto aconteceu,
+isto foi o motivo real, é bom lembrar disso da próxima vez". Entradas por data,
+mais recente primeiro. Nunca reescreve entrada antiga — só acrescenta.
+
+---
+
+## 08/10/2026 — o que o Rafael corrige na análise da IA (04 a 08/10)
+
+Base: `revisoes_rascunho`, 67 edições de `proxima_acao` e 122 de checklist.
+Nenhuma mudança aplicada ainda; isto é diagnóstico.
+
+**Antes de ler qualquer padrão: boa parte dos dados é ruído do painel.**
+
+- 85 dos 117 checklists com `depois: []` são defeito, não escolha. No
+  rascunho tratado na mão o formulário abre sem passos; ao salvar com troca de
+  status, o gatilho do banco insere o modelo do status novo e, logo depois,
+  `salvarChecklist([])` apaga. A tela não mostra lista vazia, então ele não vê.
+  Código: `exemplo-adv-controladoria/app/processos/[id]/RascunhoDetalhe.tsx`
+  (`passosTocados`) e `actions.ts` (`salvarChecklist`).
+- 26 dos 80 rascunhos da IA têm `status_sugerido`/`proxima_acao` marcados em
+  `campos_editados_manualmente` sem a revisão correspondente. Causa confirmada:
+  o CHECK `revisoes_rascunho_motivos_check` não aceita o motivo `alerta`, então
+  todo salvamento que mexia na "Atenção crítica" perdia a linha inteira do
+  histórico, e `registrarRevisao` só fazia `console.error`.
+- Aprovar só copiava `proxima_acao` para `processos`. Status e responsável
+  ficavam com o palpite da IA gravado pelo robô: em 08/10, 119 de 174 processos
+  aprovados mostravam um status diferente do aprovado.
+- 47 das 66 edições de `proxima_acao` são de rascunho manual (campo vazio).
+  Mostram o estilo dele, não o erro da IA. Sobram 19 casos úteis.
+
+**Onde a IA erra a próxima ação (19 casos, um revisor, 4 dias):**
+
+1. Lê errado o ato (8): sugere protocolar o que já protocolamos; inverte de quem
+   é o recurso adesivo (era nosso); usa despacho antigo com prazo corrido;
+   inventa trânsito em julgado a partir de certidão de migração. Em 4 dos 8 as
+   certidões de migração ocupavam o lugar dos documentos recentes.
+2. "TRÉPLICA" em vez de "RÉPLICA" (3 de 3).
+3. Ação vaga ("APELACAO ou AGUARDAR") ou texto do despacho copiado.
+4. Datas: 4 caíram em fim de semana; uma análise trouxe duas datas finais.
+
+**Regras dele que a IA não sabia:** na dúvida é CIENCIA + 5 dias + "VERIFICAR",
+nunca AGUARDAR; acordo → "VERIFICAR SE HOUVE O PAGAMENTO"; sentença →
+"VERIFICAR NECESSIDADE DE RECURSO"; despacho com vários comandos tem um prazo
+para cada (o caso "15 DIAS É SÓ PRA TESTEMUNHA, PRO RESTO É 5"); texto curto,
+no imperativo, sem justificativa. Prazo interno dele não segue "fatal − 3".
+
+**Passo a passo:** vem só do modelo por status, a IA não escreve. Nos 30
+rascunhos da IA ele nunca manteve o modelo inteiro; quando escreve, é um passo
+só, específico do caso. "Comunicar o cliente" (em 18 dos 21 modelos) não
+sobreviveu em nenhuma edição.
+
+**Lição:** antes de tirar conclusão sobre o que o usuário "quis", conferir se
+o registro da edição é fiel. Aqui, 2/3 do sinal do checklist era o painel.
+
+---
+
+## 08/10/2026 — o robô passa a se recuperar sozinho, e por que não esperamos a causa
+
+Em vez de mais uma hipótese sobre por que a aba fica muda, a rodada passou a
+lidar com qualquer aba muda. Testado num Chrome descartável antes de decidir:
+
+- aba presa num alerta trava a conexão; **fechá-la pelo endereço de debug
+  destrava em 0,4s**. Dispensar o alerta pela própria aba não funciona.
+- logo, recuperar é: fechar toda aba muda, garantir uma aba do sistema em uso
+  (o login mora nos cookies) e tentar o mesmo processo de novo.
+
+O que mudou (`runner.py`, `chrome_saude.py`, extratores):
+
+1. Conexão travada com Chrome vivo → recuperação e nova tentativa.
+2. Falhou de novo → desiste **só daquele sistema**; a rodada segue. Até aqui
+   ela parava inteira, e o PJe, último da fila, pagava sempre.
+3. A limpeza nunca fecha aba de outro sistema nem tela de login.
+4. Sistema sem aba no início do bloco ganha uma aba nova.
+5. Teto de conexão de 180s para 30s (ver `divida-tecnica.md`).
+
+Testes: `test_rodada_recuperacao.py` (rodada inteira com extrator falso, os três
+desfechos) e `test_chrome_recuperacao.py` (Chrome real: alerta trava, recuperação
+destrava, aba sumida volta). Os testes da rodada falham se o comportamento
+antigo voltar.
+
+Como medir se melhorou: % do que entrou que foi extraído (era 47% de 02 a 07/10),
+rodadas que terminam sem `rodada.abortada`, e quantas vezes aparece
+`chrome.recuperacao` seguida de sucesso.
+
+---
+
+## 07/10/2026 — a limpeza fecha a aba do PJe, e a sondagem achou a aba muda
+
+Rodadas de 06/10 (ainda sem a sondagem) e 07/10 (já com ela). Corrige a
+entrada de 06/10: lá a limpeza não teve culpa, **mas nas outras teve**.
+
+**1. A limpeza fecha a aba inicial do PJe durante o bloco do eProc.** Aconteceu
+em 02/10, 06/10 e 07/10. A aba do PJe (QuadroAviso), parada esperando a vez,
+troca de id no meio do bloco do eProc, e a limpeza a toma por aba vazada.
+A trava `aba_de_trabalho` só protege o sistema em uso, não o que vem depois.
+Em 06/10 isso sozinho custou os 23 processos do PJe: "SEM ABA", devolvidos
+com "o sistema não estava aberto". Em 06/10 a limpeza também fechou a aba do
+RUPE (que já tinha terminado).
+
+**2. A aba muda é a aba de trabalho do próprio PJe.** Em 07/10 o PJe achou a
+aba do SSO do TRF6, leu 1 processo e o Chrome trocou o id da aba (poupada).
+A sondagem, 10s depois: a aba nova do PJe (`listAutosDigitais`) **não
+responde**, e a do eProc TJMG também não. O RUPE responde. Nas duas falhas
+de conexão seguintes, a mesma aba do PJe continuava muda, e a rodada abortou.
+Nenhuma aba que respondeu estava descartada, o que enfraquece a hipótese da
+economia de memória. A que mais combina é uma caixa de diálogo (alert) aberta
+na página do PJe: o extrator neutraliza `confirm` e `window.open`, mas não
+`alert`. O eProc mudo junto pode ser por dividir o processo do Chrome com o
+PJe (mesmo site `tjmg.jus.br`), mas isso é inferência.
+
+**3. O PJe vai por último e a rodada morre nele, então os mesmos processos
+nunca são lidos.** Dos 20 PJe pendentes dos lotes 05–07/10, 19 nunca foram
+tentados em rodada nenhuma.
+
+**4. O eProc TRF6 nunca está pronto.** "SEM ABA" no início das rodadas de
+05, 06 e 07/10. Em 07/10 a aba estava parada no retorno do login
+(`sso.cloud.pje.jus.br/.../broker/trf6/endpoint`), sem chegar no eProc.
+Em setembro passaram 11 do TRF6 (09/11 e 09/15), nos dias em que a aba
+estava logada quando chegou a vez dele.
+
+**5. O travamento não é do PJe.** No backup de 30/09 ele aparece no eProc
+TRF6 (15/09) e no eProc TJMG (18/09, logo depois de uma `abas.poupada` do
+RUPE). Quem estiver rodando na hora paga, e desde 31/08 o PJe é o último e o
+maior. A combinação que mudou o quadro do PJe: limpeza (19/08) + PJe esperando
+a vez enquanto o eProc roda (31/08).
+
+**Descartadas no mesmo dia, num Chrome descartável:** (a) janela nova aberta
+pela página bem na hora em que o robô desconecta ficaria pausada: não
+reproduziu, a conexão seguinte entrou em 0,2s; (b) ler a caixa de diálogo
+pela própria aba: com o alerta aberto a aba não responde nem ao `Page.enable`,
+então por dentro do Chrome não dá para saber.
+
+---
+
+## 06/10/2026 — PJe de volta para "pendente": não foi a limpeza, foi a conexão que travou
+
+Rodada de 05/10 (15:41–17:06, máquina do Rafael): 57 processos, 37 lidos, 1
+erro, 18 de volta na fila. Suspeita inicial era a limpeza de abas. Os dados de
+`eventos_extracao` descartam isso.
+
+**O que aconteceu, em ordem:**
+
+1. eProc TJMG: 16/16 lidos, 20 minutos.
+2. eProc TRF6 (3 processos): falhou no 1º com `sessao_expirada` no minuto 20.
+   A aba estava no SSO (`sso.cloud.pje.jus.br`), ou seja, o login não estava
+   feito ou caiu. Os 3 voltaram para a fila. Aqui a ordem pesou, sim.
+3. PJe: 22 de 38 lidos, sem nenhum erro, durante 1 hora. Depois do 22º, o
+   processo 23 travou em `connect_over_cdp` por 180s (`ws connected`, mas a
+   conexão nunca terminou). O Chrome respondia ao ping simples. O 24º travou
+   do mesmo jeito → 2ª falha → rodada abortada. O 23 ficou `erro_browser`; os
+   15 seguintes, nunca tentados, voltaram para `pendente`.
+
+**Por que não foi a limpeza:** ela registra toda aba que fecha
+(`abas.limpeza`), e na rodada de 05/10 não há nenhum registro desses. E quem
+escreve `pendente` é o `_devolver_a_fila`, chamado pelo aborto por CDP, não
+pela limpeza. A limpeza só *poupou* uma aba (`abas.poupada`).
+
+**O padrão que aparece:** desde a base zerada de 30/09 houve só duas
+`abas.poupada` (o Chrome trocou o id da aba de trabalho). **Nas duas, o
+processo seguinte travou na conexão e a rodada morreu:**
+
+- 02/10 12:00 — poupada no eProc → 1004718 e 1005175 travam → 101 devolvidos.
+- 05/10 17:00 — poupada no PJe → 5010585 e 5016149 travam → 15 devolvidos.
+
+Nenhuma rodada sem troca de id teve esse travamento (a de 04/10 foi outra
+coisa: Chrome fechou de verdade, `ECONNREFUSED`, nenhuma aba).
+
+Dois casos são pouco para provar causa, mas é a pista mais forte. Hipótese,
+**não confirmada**: a troca de id indica que a aba antiga foi substituída
+(por exemplo, aba descartada pela economia de memória do Chrome e recriada),
+e sobra um alvo que o Playwright tenta anexar e que nunca responde.
+
+**Achado à parte:** em 05/10, logo antes do travamento, apareceu uma aba
+`www.uniaoseguradora.com.br` no Chrome do robô e sumiu a aba original do
+PJe (QuadroAviso). Não se sabe se foi o Rafael navegando nessa janela ou
+outra coisa. A limpeza não toca nela (não é `.jus.br`).
+
+**Achado à parte, não é bug:** os 9 eProc TJMG pendentes de hoje (incluindo
+1005177, lido em 05/10) são publicações novas do lote de 06/10. Voltaram à
+fila pela reinserção, que é o comportamento esperado.
+
+**Medido no mesmo dia, num Chrome descartável na máquina do Leo:** uma única
+aba com caixa de alerta aberta faz o `connect_over_cdp` estourar o prazo. Sem
+a aba, conecta em 0,2s; com ela, timeout. É o mesmo sintoma das duas rodadas.
+O robô já reconectava do zero a cada processo, então "reconectar" não seria
+conserto. Entrou a sondagem (`chrome_saude.py`, evento `abas.sondagem`), que
+pergunta a cada aba se responde e se foi descartada, e só observa: muda nada,
+para a próxima rodada dizer qual das hipóteses é. Consulta 8 em
+`consultas-diagnostico.md`.
+
+---
+
+## 11/09/2026 — a limpeza fechou a aba do eProc, e agora está provado
+
+Rodada na máquina do Rafael, a primeira depois de tirar o registro de
+inicialização duplicado (10/09) e de o watchdog parar de pré-abrir o Chrome.
+Fila de 100: RUPE 18, eProc TJMG 17, TRF6 7, PJe 57, 1 sem sistema.
+
+**O "Abrir sistemas" caiu no caminho frio pela primeira vez nesta máquina**
+("Chrome não respondeu — vai ser aberto do zero"), com as 4 abas confirmadas em
+14s. É o efeito esperado de fd0f629.
+
+**A aba do eProc TJMG sumiu de novo — e desta vez o rastro diz quem fechou.**
+Às 15:56:49, logo após o 5º processo (`1141216-61`), o `abas.limpeza` fechou
+`eproc1g.tjmg.jus.br/...processo_selecionar&num_processo=1141216...` — a página
+do próprio processo 5. Dois segundos depois o 6º deu "Nenhuma aba do eProc", e
+os 12 restantes voltaram para a fila.
+
+O raciocínio que fecha:
+- o extrator do eProc nunca abre aba; trabalha sempre na mesma. Logo a aba
+  fechada era a de trabalho;
+- a limpeza só fecha aba cujo id não estava na foto do início do bloco. Nos
+  processos 1 a 4 ela não tocou na aba — o id ainda era o original. Entre
+  15:54:25 e 15:56:49 o Chrome passou a apresentar a mesma aba com id novo, e
+  a limpeza a tratou como lixo;
+- navegar não troca id: a aba do TRF6 foi para `processo_selecionar` às 15:57
+  e manteve o dela;
+- o Leonardo confirmou que ninguém mexeu no Chrome. A troca é do próprio
+  Chrome, e a causa segue desconhecida.
+
+**Isso muito provavelmente responde 09/09.** Naquele dia o vigia provou o id
+inalterado até 12:31 e morreu; a aba sumiu até 12:43. Troca de id depois de
+12:31 mais uma limpeza é o mesmo mecanismo. Não dá para provar para trás.
+
+**Conserto em ad53945:** a limpeza não fecha a última aba do sistema em uso;
+ela fica e vira a aba de trabalho oficial do bloco. O evento novo
+`abas.poupada` grava o id novo e os do início — na próxima troca, fica
+registrado quando aconteceu. O conserto impede o dano, não explica a troca.
+
+**Sessão do eProc parada: o piso subiu de 22 para ~28 min.** Login entre 15:15
+e 15:23, primeiro uso às 15:51:08, e funcionou. A tese "o eProc morre esperando
+o RUPE" perde força de novo.
+
+**O `2244305-09.2026.8.13.0000` parou de travar a rodada.** Antes gastava ~14
+min e nunca terminava; hoje respondeu "não localizado no RUPE" em ~2 min.
+O RUPE inteiro (18) levou 28 min: 12 extraídos, 6 não localizados.
+
+**Certificado digital, de novo:** 15 recusas nos primeiros 27 do PJe — mesmo
+número de 09/09.
+
+**A rodada foi interrompida às ~16:30** com o PJe em 34/57, porque a equipe
+precisou sair do escritório. Os não processados continuam `pendente` (o agente
+não usa estado intermediário), e o comando fica `em_andamento` sem batimento —
+o painel e o agente o tratam como abandonado depois de 90 min. Para a próxima:
+rodar o `atualizar.bat` na máquina do Rafael (leva ad53945) e extrair de novo
+os pendentes, eProc TJMG incluído.
+
+---
+
+## 09/09/2026 — duas janelas do agente, e a hipótese que fecha o 08/09
+
+O Rafael tinha **duas janelas pretas** do agente abertas. O certo é uma.
+
+**Correção do mesmo dia:** minha primeira explicação foi o `atualizar.bat`
+abrindo uma janela extra numa corrida de tempo. **Estava errada.** O Rafael
+depois esclareceu que as duas janelas abrem **ao ligar o computador**, sem
+ninguém rodar nada — ou seja, são dois registros de inicialização automática,
+não um efeito do script de atualização.
+
+A causa real: existem **dois scripts que fazem a mesma coisa** — `agente.bat`
+(laço de 5s) e `agente-watchdog.bat` (laço de 10s, e ainda sobe o Chrome). Os
+dois chamam `agente.py`, os dois se reiniciam sozinhos. Registrar os dois na
+inicialização dá exatamente duas janelas. Na máquina do Leonardo há **um**
+registro só (Tarefa Agendada apontando para o watchdog), que é o esperado.
+
+O defeito que eu tinha achado no `atualizar.bat` é real e foi corrigido (ele
+conferia python e abria vigia — coisas diferentes), mas **não era a causa
+disto**. Vale como conserto próprio, não como explicação.
+
+**Por que importa mais do que parece — e aqui está o achado sério:** a trava
+que impede dois agentes de rodarem ao mesmo tempo (`ha_rodada_em_andamento`)
+ignora comando parado há mais de 90 minutos, tratando como rodada abandonada. E
+`atualizado_em` **só é escrito duas vezes**: quando o comando é reivindicado e
+quando termina. Nada durante a rodada.
+
+Ou seja: **rodada que passe de 90 minutos vira invisível para o segundo
+agente**, que então inicia uma segunda extração — no mesmo Chrome, com as duas
+mexendo nas mesmas abas e cada uma fechando as abas "vazadas" que a outra
+acabou de abrir. Com um agente só isso nunca podia acontecer. Com dois, é
+questão de a rodada ser longa o bastante — e já houve dia com mais de 6 horas
+de extração.
+
+Não está provado que causou o eProc TJMG sem aba, mas é o primeiro mecanismo
+encontrado que explicaria uma aba sumir no meio da rodada. O conserto de fundo é
+o batimento: o agente escrever `atualizado_em` periodicamente enquanto trabalha,
+para "está vivo" e "está parado" deixarem de ser indistinguíveis.
+
+Ferramenta criada no mesmo dia: `conferir-janelas.bat` (duplo-clique) relata
+todos os pontos de inicialização automática da máquina para o Supabase, sem
+alterar nada.
+
+**A hipótese que isso abre para o travamento de 08/09:** aquele `Stop-Process
+-Force` mata o agente sem cerimônia, no meio do que ele estiver fazendo. Se
+rodar enquanto uma rodada está em andamento, o processo morre entre reivindicar
+o comando e escrever o desfecho — e o comando fica `em_andamento` para sempre,
+**sem nenhuma exceção gravada, porque não houve exceção: houve morte**.
+
+Bate exatamente com a assinatura de 08/09 às 15:46: comando reivindicado em
+0,8s, nunca mais atualizado, nada no bloco de erro. E bate com as duas janelas
+terem aparecido no mesmo dia. Não está provado — exigiria a máquina dele no
+momento — mas explica os dois sintomas com um mecanismo só.
+
+**O que ficou pendente:** o `atualizar.bat` continua matando rodada em
+andamento. A correção de hoje resolve a janela duplicada, não o kill. Enquanto
+isso, atualizar durante uma extração continua podendo orfanar o comando.
+
+**O que isso NÃO explica:** o eProc TJMG sem aba. Dois agentes não brigam pelo
+mesmo comando (a trava é atômica), então essa conta continua aberta.
+
+---
+
+## 09/09/2026 — o eProc voltou, e nenhuma das explicações sobreviveu
+
+Rodada de teste na máquina do Leonardo, com a observabilidade de 08/09 estreando.
+Fila de 73 (35 eProc TJMG, 33 PJe, 5 RUPE). **O eProc TJMG extraiu os 35 pela
+primeira vez desde 19/08** (33 ok, 2 perdidos por bug de gravação). O problema
+que abriu o dia foi embora — e a causa dele continua sem resposta.
+
+**Quatro explicações levantadas e derrubadas no mesmo dia**, três delas do
+Claude. Vale mais que a conclusão, porque cada uma custou uma investigação:
+
+| Hipótese | O que a derrubou |
+|---|---|
+| A aba nunca chegou a abrir | `abrir.aba_confirmada` provou que abriu (10:46:59) |
+| A sessão do eProc expirou | o host sobrevive ao logout — um eProc deslogado continua em `eproc1g.tjmg.jus.br`, e daria "sessão expirada", nunca "Nenhuma aba". Medido no próprio rastro: um login recusado às 10:48:53 ficou no mesmo host |
+| O fallback do PJe roubou a aba | bug real e consertado (65b8019), mas não foi ele: naquela rodada o PJe achou a aba dele |
+| O Chrome descartou a aba por memória | o Rafael/Leonardo olhou a barra de abas: a aba não estava lá. Descarte deixa a aba visível |
+| A limpeza de abas fechou | o vigia provou que o ID da aba nunca mudou entre 11:04 e 12:31 — ela estava protegida por `ids_no_inicio` |
+
+**O que ficou provado:** a aba do eProc estava viva às 12:31:56 e sumiu até
+12:43:52, e nenhum código conhecido pode tê-la fechado nessa janela. A janela é
+exatamente onde o vigia de abas morreu junto com a sessão do Claude. Fica em
+aberto, com a instrumentação que faltava agora no lugar (`abas.limpeza`).
+
+**Sobre "a sessão envelhece esperando a vez":** ficou um piso medido. O login do
+eProc foi às 10:49:57 e o primeiro uso às 11:12:41 — **22 minutos parado, e
+funcionou**. Não prova que aguenta mais; prova que 22 não derruba, o que já
+enfraquece bastante a explicação de que os 26 minutos do RUPE matavam o eProc.
+
+**Achado de negócio, não de código:** 15 dos 33 processos do PJe foram recusados
+com *"o acesso à íntegra dos autos por advogados não vinculados ao processo
+somente é permitido mediante login com certificado digital"*. Quase metade da
+fila do PJe é inacessível com login de usuário e senha. Isso nunca tinha
+aparecido separado porque antes virava "Login não concluído? Verifique".
+
+**A observabilidade nova mordeu a si mesma.** Às 12:07 um `WinError 10054`
+(conexão resetada) desligou a gravação em `eventos_extracao` **para o resto da
+rodada** — comportamento projetado (`_remoto_desligado`), para 200 eventos não
+esperarem timeout. Na prática, um blip de segundos virou 31 minutos de cegueira,
+e o diagnóstico do dia saiu do log local. É o padrão de 08/09 ("avisa quando
+falha, fica mudo quando o avisar falha") acontecendo dentro do módulo escrito
+para acabar com ele. Ver dívida técnica.
+
+**A trava de rodada vence antes da rodada.** `ha_rodada_em_andamento` ignora
+comando com `atualizado_em` mais velho que 90 min, e nada tocava esse campo
+durante a rodada. Com 73 processos a rodada passou de 90 minutos: às 12:42, com
+o PJe em 22/33, a trava venceu **com a extração rodando**. Renovada na mão na
+hora; corrigida em 3aa2ee6 (a rodada bate ponto a cada 5 min).
+
+**Método que funcionou e vale repetir:** antes de gastar a rodada, rodar o
+próprio código que falha (`encontrar_aba_eproc`) contra o Chrome de verdade, sem
+extrair nada. Custou 1 segundo e respondeu o que 25 minutos de rodada
+responderiam. E o vigia de abas — um laço de 4 em 4 segundos registrando só
+mudança de URL — foi o que derrubou duas das hipóteses acima. Nenhum dos dois
+existe no projeto; foram scripts de sessão. Talvez devessem existir.
+
+**Cruzamento com a outra entrada de hoje (dois agentes):** aquela entrada
+descreve dois agentes rodando juntos, cada um fechando as abas "vazadas" que o
+outro acabou de abrir — mecanismo capaz de produzir "Nenhuma aba do eProc" sem
+que a limpeza de nenhum dos dois esteja errada. **Não foi a causa de hoje:**
+conferido na hora pelo processo pai, os dois PIDs de `agente.py` na máquina do
+Leonardo são pai e filho (shim), um agente só. Mas encaixa no histórico: os 35
+processos travados são da máquina do **Rafael**, com `data_ultima_consulta` de
+26/08, e é a máquina onde existiam **dois** registros de inicialização. É a
+primeira explicação que cobre o período inteiro (19/08–26/08) em vez de um
+episódio isolado. Não provada — depende de olhar a máquina dele.
+
+**Decisão de escopo que se pagou:** o Leonardo apontou que deixar o RUPE rodar
+antes (26 min) confundiria "eProc consertado" com "eProc morreu esperando". A
+aba do RUPE foi fechada de propósito para isolar o eProc, e registrado o porquê
+em `eventos_extracao`. Sem isso, o sucesso do eProc às 11:13 seria ambíguo.
+
+---
+
+## 08/09/2026 — o dia dos três avisos otimistas
+
+Numa rodada só, três etapas diferentes falharam e, nas três, a mensagem que
+chegou até o Leonardo/Rafael disse que tinha dado certo. Padrão que vale
+vigiar em qualquer coisa nova: **uma etapa que só avisa quando falha, e fica
+muda quando o "avisar" em si falha, sempre mente por omissão.**
+
+1. **"Abrir sistemas" travou sem escrever nada.** A primeira chamada que essa
+   ação faz — perguntar ao banco quais processos estão pendentes — não tinha
+   limite de tempo. Uma rede engasgada ali prendia a função inteira, sem
+   exceção pra cair no bloco de erro. Corrigido: teto de 3 minutos
+   (`TIMEOUT_ABRIR_SISTEMAS_S`, `agente.py`).
+
+2. **Chrome caiu no meio da extração — e o resumo culpou o login.** O circuito
+   de segurança que aborta a rodada quando o Chrome para de responder
+   funcionou certinho, gravou o motivo certo em cada processo devolvido. O
+   problema era só a frase-resumo do topo: ela só reconhece uma lista fixa de
+   causas conhecidas, e "Chrome parou de responder" não estava nessa lista —
+   então caiu no texto genérico "Login não concluído? Verifique", que é a
+   causa errada e manda a pessoa checar justamente o que estava certo.
+
+3. **eProc TJMG "não estava aberto" — mas a aba nunca foi confirmada.**
+   "Abrir sistemas" listou "Abri eProc TJMG" no resumo, mas essa lista é
+   montada a partir de QUEM PRECISAVA ser aberto, não de quem de fato abriu.
+   O pedido HTTP que abre a aba tem 5s de prazo e pode falhar silenciosamente
+   — só um aviso no terminal que ninguém vê. 24 minutos depois, quando a
+   extração tentou usar aquela aba, não achou nenhuma — e a falha inteira do
+   sistema (35 processos) aconteceu em menos de 1 segundo, sinal forte de que
+   a aba nunca chegou a existir, não de que sumiu no meio do caminho.
+
+**Fio comum:** nas três, o código sabia a verdade internamente (o motivo certo
+estava gravado por processo, no caso 2) ou tinha como saber e não checou (casos
+1 e 3). O consertos pontuais (timeout, mensagem melhor) resolvem o sintoma de
+cada um. A causa de fundo — falta de confirmação depois de cada ação, e
+mensagens-resumo otimistas por padrão — é maior que os três juntos. Ver
+`docs/fluxo-extracao-passo-a-passo.md` para o mapa completo de onde isso ainda
+acontece.
+
+**Achado à parte, não-bug:** o RUPE levou 26 minutos para 6 processos nessa
+mesma rodada. Não é regressão — já é comportamento conhecido e documentado
+(`divida-tecnica.md`, item do CNJ que sozinho levou 14 min). O sistema
+simplesmente é lento.
+
+**Achado à parte, explica um "estranho":** a regra que decide "sessão
+envelheceu esperando a vez" mede o tempo desde que a RODADA DE EXTRAÇÃO
+começou — não desde que a pessoa efetivamente logou. Numa noite com mais de
+uma tentativa (uma rodada fracassada, depois outra), o login pode ter
+acontecido bem antes da rodada que finalmente rodou, fazendo a sessão parecer
+mais "nova" do que realmente estava. Isso pode (ainda não confirmado) explicar
+por que o PJe expirou aos 22 minutos quando historicamente aguentava 40+.
+
+## 12/10/2026 — Rodada interrompida ficava "em andamento" para sempre
+
+A rodada `3fac9de9` (extrair, 09/10/2026) começou às 14:46 e parou por volta
+das 14:51 (horário de Brasília), quando o agente foi encerrado no meio. Ela
+analisou 5 processos, todos com rascunho certo: 5002303-20 e 5013217-58 (RUPE),
+1005183-31, 1005159-03 e 1001282-55 (eProc TJMG). Os 2 que faltaram do eProc
+TJMG (1001534-58 e 1001036-59) entraram na rodada `5638f3a8`, de 12/10. Na
+consulta de eventos ela aparece sem `extrair.fim`. Isso não é defeito de
+observabilidade: é a interrupção.
+
+Ninguém encerrava o comando, então ele ficou `em_andamento`. Não bloqueava
+nada, porque a regra dos 90 min já o ignorava, mas o histórico mentia. Tentei
+trocar a etiqueta direto no banco e o conector do Supabase recusou o UPDATE (a
+confirmação de alteração de dados voltou "declined" três vezes).
+
+Correção: o agente parado agora confere a cada minuto e encerra
+(`marcar_interrompidas`) as rodadas do próprio computador sem batimento há mais
+de 10 min, e as de qualquer computador sem notícia há mais de 90 min. O
+batimento da rodada passou de 5 min para 1 min. A `3fac9de9` deve ser encerrada
+assim que o primeiro agente atualizado ligar.
+
+## 15/10/2026 — Raio-x dos processos de 02/10 a 15/10
+
+Análise só de leitura no banco, 255 processos. Principais fatos:
+
+- **Revisão parada.** Nenhum rascunho aprovado desde 08/10 (última revisão
+  2026-10-08 22:09 UTC). 81 aguardam aprovação, 11 críticos. Estimativa: 1
+  prazo fatal já venceu, 1 vence 15/10 e mais 11 vencem até 22/10. 44 dos 81 não
+  têm prazo preenchido pela IA. Tarefas: 45 abertas, 40 com a Marina; 7 com prazo
+  fatal vencido (não confirmado se é atraso real ou tarefa não marcada como
+  concluída).
+- **Robô melhorou depois de 08/10.** Até 07/10: 52% viraram manual. Depois: 8%
+  de falha. Os 86 `tratado_manual` são quase todos (84) de antes de 08/10 e
+  nenhum tem documento. "Chrome não respondeu" foi efeito dominó de 4 rodadas
+  derrubadas, e caiu quase todo no PJe porque ele vem por último.
+- **5 CNJs falham em toda rodada:** 5002278-63.2018 (PJe), 5948746-33,
+  5003683-90 e 5004925-84 (RUPE), 6005862-13 (eProc JFMG).
+- **O cartão "Qualidade da análise" mistura manual com IA.** Dos 180 revisados,
+  91 são `tratado_manual` (rascunho sem `modelo_ia`). Só IA: 89, 10 aprovados
+  direto.
+- **Prazo fatal da IA erra para mais:** 3 casos de 15 dias úteis quando o certo
+  era 5 ou 10, e 5 intimações sem prazo, onde o certo era 5. O padrão continua
+  em rascunhos gerados depois do ajuste de 09/10.
+- **Responsável:** a regra por status acerta cerca de 83%. Ela falha em
+  MANIFESTAR (sem critério claro) e em apelação cível (quase sempre Marina).
+- **Custo** baixo e estável: US$ 5,63 em 10 dias úteis, cerca de US$ 12/mês,
+  modelo Haiku 4.5. eProc TJMG é o mais caro (documentos grandes). O PJe é o
+  mais lento, cerca de 6s por documento.
+- **RUPE aparece com dois nomes** (`pje_2g` e `pje_tjmg_2inst`), e os motivos
+  do painel não batem com o banco (65/17/7 contra 71/10/9).
+
+## 17/10/2026 — Painel: 0% no dia 16, 55% em dois dias e processo "pendente" com rascunho aprovado
+
+Investigação só de leitura (banco + código do painel). Quatro problemas, uma
+causa principal.
+
+- **Causa principal: uma linha por CNJ.** Quando um processo volta a sair numa
+  pauta nova, a ingestão (`lib/gmail/gravacao.ts`, decisão de 10/09) sobrescreve
+  `lote_id` com a data nova e volta `pje_status` para `pendente`. Documentos e
+  rascunho da análise anterior ficam. Efeitos: o processo sai do dia antigo e
+  entra no novo (a pauta de 13/10 tinha 30 CNJs e o painel mostra 28; 14/10, 21
+  e mostra 19; 15/10, 22 e mostra 21), e no dia novo ele aparece "Pendente" com
+  documentos, rascunho "Aprovado" ou "Aguardando aprovação" e o cartão "A
+  extração ainda não trouxe este processo". Dos 17 do dia 16, 6 são assim
+  (n.º 4, 7, 12, 13, 16 e 17).
+- **Taxa conta quem nem foi tentado.** O denominador é tudo que entrou, menos
+  duplicata (`entraNaTaxa`). Em 16/10 não houve rodada (nenhum comando `extrair`
+  no dia), então 0 de 17. De 15 a 16: 21 de 38 = 55%, sem nenhuma falha real.
+- **Tentativa repetida conta uma vez, pelo estado final.** Falha intermediária
+  some: a rodada de 15/10 teve "5 com erro", mas eram processos de 09/10 e 13/10
+  que falham toda rodada; o dia 15 aparece 100%. O histórico de tentativas existe
+  em `eventos_extracao` (`etapa = 'cnj.fim'`), o painel não lê.
+- **"Aguardando aprovação" discorda entre topo e tabela.** O cartão do topo só
+  conta rascunho pendente de processo `processado`; a tabela mostra o status do
+  rascunho de qualquer processo. Em 16/10: topo 0, tabela 3. E o rascunho antigo
+  pendente pode ser aprovado como se fosse da publicação nova.
+- **Dá para reconstruir o histórico:** `emails_recebidos.parser_resultado` guarda
+  os CNJs de toda pauta desde 30/09.
+
+**Correção aplicada em 17/10/2026** (painel e banco, sem deploy ainda):
+
+- Tabela `publicacoes`: uma linha por processo e por pauta. Um gatilho em `processos`
+  mantém a publicação atual em dia; quando o processo sai de novo, a anterior fica com o
+  desfecho que teve, ou `substituida` se nem foi tentada (aí ela herda o estado da
+  seguinte). Histórico refeito desde 28/09 a partir de `emails_recebidos`. Nada no
+  agente precisou mudar. O gatilho nunca bloqueia a gravação do processo.
+- Taxa de extração = extraídos ÷ tentados. Pendente fica fora e aparece como
+  "N aguardando rodada". Dia sem rodada mostra "—", não 0%. Em 15–16/10: 22 de 22.
+- Rascunho pertence à publicação mais recente que já existia quando ele foi gravado.
+  Aguardando aprovação, custo e qualidade passam a seguir a publicação.
+- Processo republicado diz, na tela, de que pauta são os documentos e o rascunho.
+
+## 17/10/2026 — Rascunho nunca é sobrescrito; vários rascunhos e tarefas por processo
+
+Decisões do Leonardo, aplicadas no banco, no painel e no robô (sem deploy ainda):
+
+- **Rascunho nunca é sobrescrito.** O robô reescrevia o rascunho pendente quando
+  analisava o processo de novo; iam embora a providência anterior e as edições do
+  gestor. Agora `supabase_writer._inserir_rascunho` sempre insere. Enquanto o robô
+  antigo roda em algum computador, o gatilho `rascunhos_nao_sobrescreve` transforma
+  a reescrita em rascunho novo (reconhece pela `data_extracao`, que só o robô grava).
+  Testado: o antigo fica intacto e a edição do gestor continua gravando.
+- **Cada rascunho sabe a pauta que analisou** (`rascunhos.publicacao_id`, preenchido
+  por gatilho; os 262 antigos pela regra de horário). O prazo conta dessa pauta.
+- **Cada tarefa guarda a sua providência** (`tarefas.proxima_acao` e `status_atual`).
+  Antes vinha do processo, que é um só: várias tarefas mostravam o mesmo texto, e a
+  reanálise do robô trocava o texto de uma tarefa já aprovada. As antigas receberam
+  o texto que mostravam.
+- **Aprovar análise antiga não volta o topo do processo para trás**: o topo só muda
+  se não houver aprovação mais nova.
+- **Avisos antes de aprovar** (análise antiga, publicação nova sem análise, tarefa
+  aberta) só pedem confirmação. Regras em `lib/avisos-aprovacao.ts`.
+- **Aguardando aprovação conta cada rascunho pendente**, no dia da pauta dele.
+- **Motivos de falha** lê `publicacoes`: a falha fica no dia em que aconteceu.
+
+## 23/10/2026 — Feedback semanal do Rafael
+- Semana 17/10 a 21/10: 94 rascunhos da IA revisados, 54 aprovados direto, 40 com edição, 0 rejeitados.
+- Prazo fatal: IA pôs 15, 15 e 7 onde ele corrigiu para 5 (petição de provas); 2 sem prazo; ciência 5 virou 6 em 2 casos; 1 manifestar 5 virou 10.
+- Aguardar contra ação: 6 casos em que a IA sugeriu ação e ele pôs Aguardar, 9 no sentido contrário; em 6 ele trocou o responsável para a Marina (dos 38 em Aguardar, 20 ficaram com ele e 18 com a Marina).
+- Respostas dele lidas: nenhuma. As perguntas da aba de 16/10 seguem sem resposta, por isso a aba nova não as repete.
+- Aba nova publicada no mesmo artefato, com 5 perguntas.
+
+## 30/10/2026 — Feedback semanal do Rafael
+- Semana 24/10 a 30/10: 0 rascunhos da IA revisados. A última revisão no painel foi em 21/10.
+- Fila: 141 rascunhos da IA pendentes (131 processos); o mais antigo desde 14/10.
+- Sem revisões, não há padrão novo. A aba de 30/10 só registra isso, sem perguntas.
+- Respostas dele lidas: nenhuma, nem em 16/10 nem em 23/10. Rodada atrasou e rodou na virada para 31/10.
