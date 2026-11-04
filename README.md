@@ -77,7 +77,7 @@ The agent never opens a port. It only polls Supabase, so it works behind any off
 | Database | Supabase: Postgres, Row Level Security, PL/pgSQL triggers, `pg_cron`, Vault, Auth |
 | Integrations | Gmail API (OAuth2, called with `fetch`), Claude API |
 | Tests | Vitest for `web/`, pytest for `agent/` |
-| CI | GitHub Actions (Ubuntu for `web/`, Windows for `agent/`) |
+| CI and packaging | GitHub Actions (Ubuntu for `web/`, Windows for `agent/`), Docker image for `web/` |
 
 ## Key technical decisions
 
@@ -127,6 +127,16 @@ pip install -r requirements.txt
 copy .env.example .env        # Anthropic key and Supabase service key
 python agente.py
 ```
+
+To run the panel in a container instead (`web/Dockerfile`, multi-stage, Next.js standalone output):
+
+```bash
+docker build web -t legal-docket-web \
+  --build-arg NEXT_PUBLIC_SUPABASE_URL=... --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=...
+docker run -p 3000:3000 --env-file web/.env.local legal-docket-web
+```
+
+CI builds this image and checks that it serves HTTP. The agent is not containerized: it drives the desktop Chrome of the user who is logged in to the court systems.
 
 The agent expects Chrome to be started with `--remote-debugging-port=9222` (`agent/windows/iniciar-chrome-debug.bat`) and the user to be logged in to the court systems. Every environment variable is listed with a comment in `web/.env.example` and `agent/.env.example`.
 
