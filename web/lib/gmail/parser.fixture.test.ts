@@ -1,4 +1,4 @@
-import { describe, test } from 'node:test'
+import { describe, test } from 'vitest'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -23,7 +23,7 @@ interface Esperado {
 }
 
 if (!existsSync(ARQUIVO_TEXTO) || !existsSync(ARQUIVO_ESPERADO)) {
-  test('pauta real de 15/06/2026', { skip: 'fixture ausente em .fixtures-privadas/' }, () => {})
+  test.skip('pauta real de 15/06/2026 (fixture ausente em .fixtures-privadas/)', () => {})
 } else {
   const esperado = JSON.parse(readFileSync(ARQUIVO_ESPERADO, 'utf8')) as Esperado
   const resultado = parsearPauta(esperado.assunto, readFileSync(ARQUIVO_TEXTO, 'utf8'))

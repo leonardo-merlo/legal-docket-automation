@@ -1,4 +1,4 @@
-import { describe, test } from 'node:test'
+import { describe, test } from 'vitest'
 import assert from 'node:assert/strict'
 import { avisoPublicacaoIgnorada, decidirGravacao, ehDataDeLote, loteDepoisDoCorte } from './gravacao.ts'
 import type { ProcessoDaPauta } from './parser.ts'

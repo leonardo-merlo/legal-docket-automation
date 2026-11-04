@@ -76,7 +76,7 @@ The agent never opens a port. It only polls Supabase, so it works behind any off
 | `agent/` | Python 3, Playwright (Chromium over CDP), Anthropic Python SDK, `supabase-py` |
 | Database | Supabase: Postgres, Row Level Security, PL/pgSQL triggers, `pg_cron`, Vault, Auth |
 | Integrations | Gmail API (OAuth2, called with `fetch`), Claude API |
-| Tests | Node's built-in test runner (`node:test`) for `web/`, pytest for `agent/` |
+| Tests | Vitest for `web/`, pytest for `agent/` |
 | CI | GitHub Actions (Ubuntu for `web/`, Windows for `agent/`) |
 
 ## Key technical decisions
@@ -90,7 +90,7 @@ The agent never opens a port. It only polls Supabase, so it works behind any off
 ## Testing
 
 ```bash
-# web/: 149 tests with node:test (parser, routing, Gmail auth, crypto, metrics)
+# web/: 149 tests with Vitest (parser, routing, Gmail auth, crypto, metrics)
 cd web
 npm test
 npm run lint
