@@ -23,6 +23,8 @@ jobs:
       - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm test
+      # No env vars needed: Supabase and Google settings are read at request time.
+      - run: npm run build
 
   agent:
     name: agent (tests)
