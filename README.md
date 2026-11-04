@@ -103,7 +103,7 @@ python test_runner.py        # or any other test_*.py
 
 The agent tests fake the court systems, Supabase and the Claude API, so they run without credentials. The exception is `test_chrome_recuperacao.py`, which starts a throwaway headless Chrome and skips itself if Chrome is not installed. Two manual checks that need a real Chrome session or a paid API call live in `agent/tools/` and are not part of CI.
 
-CI runs all of the above on every pull request (`.github/workflows/ci.yml`).
+CI runs all of the above on every pull request (`.github/workflows/ci.yml`), except `test_chrome_recuperacao.py`: the hosted runner's Chrome does not freeze on an alert the way the office machines do, so that test runs locally only.
 
 ## Getting started
 

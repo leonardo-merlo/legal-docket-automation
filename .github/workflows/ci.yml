@@ -43,13 +43,14 @@ jobs:
           cache-dependency-path: agent/requirements.txt
       - run: pip install -r requirements.txt
       # Each test file is a plain script that exits non-zero on the first failed assert.
-      # Court systems, Supabase and the Claude API are faked; test_chrome_recuperacao
-      # starts a throwaway headless Chrome (preinstalled on the runner).
+      # Court systems, Supabase and the Claude API are faked. test_chrome_recuperacao
+      # is left out: it reproduces a tab frozen by an alert in a real Chrome, and the
+      # runner's Chrome does not freeze the same way. It runs locally.
       - name: Run tests
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($t in Get-ChildItem test_*.py) {
+          foreach ($t in Get-ChildItem test_*.py | Where-Object Name -ne 'test_chrome_recuperacao.py') {
             Write-Host "::group::$($t.Name)"
             python $t.Name
             if ($LASTEXITCODE -ne 0) { throw "$($t.Name) failed" }
