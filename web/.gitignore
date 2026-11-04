@@ -42,3 +42,10 @@ next-env.d.ts
 
 # e-mails reais usados como fixture de teste: têm nome, CPF e processo de cliente
 /.fixtures-privadas/
+
+# Configuração local de MCP/IDE/agentes — aponta para o projeto de produção
+.mcp.json
+.claude/
+.agents/
+.kiro/
+supabase/.temp/

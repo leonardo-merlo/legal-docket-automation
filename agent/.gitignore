@@ -33,3 +33,8 @@ logs/
 # Atalhos de inicializacao que o Rafael desativou na maquina dele.
 # Ficam guardados para dar para voltar atras — nao pertencem ao repositorio.
 inicializacao-desativada/
+
+# Configuração local de MCP/IDE/agentes
+.mcp.json
+.agents/
+.kiro/
