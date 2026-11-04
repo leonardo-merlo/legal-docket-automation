@@ -1,6 +1,6 @@
 @echo off
 title Diagnostico - Janelas do Agente
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo ==================================================
 echo    CONFERINDO AS JANELAS DO AGENTE

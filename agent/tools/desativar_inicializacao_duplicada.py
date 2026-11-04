@@ -30,8 +30,11 @@ resultado sem precisar pedir print.
 from __future__ import annotations
 
 import os
+import sys
 import shutil
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # agent/, onde fica observabilidade.py
 
 import observabilidade as obs
 from diagnostico_inicializacao import _rodar, _interessa, coletar

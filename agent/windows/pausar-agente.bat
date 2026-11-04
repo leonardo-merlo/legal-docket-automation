@@ -1,6 +1,6 @@
 @echo off
 title Pausar o Agente da Controladoria
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo ==================================================
 echo    PAUSANDO O AGENTE NESTE COMPUTADOR

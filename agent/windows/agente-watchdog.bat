@@ -1,7 +1,7 @@
 @echo off
 title Controladoria — Agente Local
 
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 :: O Chrome NAO e mais aberto aqui. Removido em 10/09/2026.
 ::

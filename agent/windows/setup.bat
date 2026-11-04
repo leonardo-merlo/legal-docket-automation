@@ -1,6 +1,6 @@
 @echo off
 title Controladoria - Instalacao (rodar uma vez)
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo ============================================
 echo   Instalacao do Agente da Controladoria
