@@ -76,7 +76,7 @@ The agent never opens a port. It only polls Supabase, so it works behind any off
 | `agent/` | Python 3, Playwright (Chromium over CDP), Anthropic Python SDK, `supabase-py` |
 | Database | Supabase: Postgres, Row Level Security, PL/pgSQL triggers, `pg_cron`, Vault, Auth |
 | Integrations | Gmail API (OAuth2, called with `fetch`), Claude API |
-| Tests | Node's built-in test runner (`node:test`) for `web/`, plain-assert Python test scripts for `agent/` |
+| Tests | Node's built-in test runner (`node:test`) for `web/`, pytest for `agent/` |
 | CI | GitHub Actions (Ubuntu for `web/`, Windows for `agent/`) |
 
 ## Key technical decisions
@@ -96,9 +96,10 @@ npm test
 npm run lint
 npx tsc --noEmit
 
-# agent/: each test_*.py is a plain script that exits non-zero on failure
+# agent/: 202 tests with pytest (routing, run outcomes, Chrome recovery, LLM output checks)
 cd agent
-python test_runner.py        # or any other test_*.py
+pip install -r requirements-dev.txt
+pytest
 ```
 
 The agent tests fake the court systems, Supabase and the Claude API, so they run without credentials. The exception is `test_chrome_recuperacao.py`, which starts a throwaway headless Chrome and skips itself if Chrome is not installed. Two manual checks that need a real Chrome session or a paid API call live in `agent/tools/` and are not part of CI.
