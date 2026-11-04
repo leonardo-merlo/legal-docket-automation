@@ -1,0 +1,384 @@
+openapi: 3.1.0
+info:
+  title: Legal docket automation — panel API
+  version: 0.1.0
+  description: |
+    Route handlers of the Next.js panel (`web/app/api/**/route.ts`). Most of the panel's
+    writes go through Server Actions instead; these routes are the ones called by the
+    browser with `fetch`, by Google during OAuth, and by `pg_cron`.
+
+    Error responses are `{ "error": "<message in Portuguese>" }`.
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: agent
+    description: Commands for the local Python agent
+  - name: cases
+    description: Cases and LLM drafts
+  - name: email
+    description: Manual e-mail processing (before the Gmail integration)
+  - name: gmail
+    description: Gmail OAuth connection and scheduled sync
+
+components:
+  securitySchemes:
+    gestorSession:
+      type: apiKey
+      in: cookie
+      name: sb-<project-ref>-auth-token
+      description: Supabase Auth session cookie. The user must have the `gestor` (manager) role; any other user gets 401.
+    syncBearer:
+      type: http
+      scheme: bearer
+      description: Shared secret (`GMAIL_SYNC_SECRET`) sent by `pg_cron`, compared in constant time.
+
+  responses:
+    Unauthorized:
+      description: No session, or the user is not a manager (for `syncBearer`, wrong or missing secret)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Invalid JSON body or missing required field
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: Database or upstream error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    Cnj:
+      type: string
+      description: Brazilian case number (CNJ format NNNNNNN-DD.AAAA.J.TT.OOOO)
+      example: 1000002-22.2099.8.13.0001
+
+    Comando:
+      type: object
+      description: A row of `comandos`, which the agent polls every few seconds.
+      properties:
+        id: { type: string, format: uuid }
+        acao: { type: string, enum: [iniciar, abrir_sistemas, extrair] }
+        status: { type: string, description: 'pendente while waiting for the agent, then set by the agent as it runs' }
+        mensagem: { type: [string, 'null'] }
+        computador: { type: [string, 'null'], description: Target agent id; null means any agent }
+        criado_em: { type: string, format: date-time }
+        atualizado_em: { type: string, format: date-time }
+
+    Agente:
+      type: object
+      properties:
+        id: { type: string }
+        nome: { type: string }
+        visto_em: { type: string, format: date-time, description: Last heartbeat (every 30 s) }
+        rotulo: { type: string }
+        ligado: { type: boolean, description: Heartbeat is recent enough }
+
+    Rascunho:
+      type: object
+      description: An LLM draft (row of `rascunhos`). See `db/schema.sql` for every column.
+      additionalProperties: true
+      properties:
+        id: { type: string, format: uuid }
+        processo_id: { type: string, format: uuid }
+        status: { type: string, enum: [pendente, aprovado, rejeitado] }
+        status_sugerido: { type: [string, 'null'] }
+        prazo_fatal_dias_uteis: { type: [integer, 'null'] }
+        prazo_interno_dias_uteis: { type: [integer, 'null'] }
+        justificativa: { type: [string, 'null'] }
+        modelo_ia: { type: [string, 'null'] }
+        custo_usd: { type: [number, 'null'] }
+
+    ResultadoProcessamento:
+      type: object
+      properties:
+        novos: { type: array, items: { $ref: '#/components/schemas/Cnj' }, description: Queued as new cases }
+        ja_existentes: { type: array, items: { $ref: '#/components/schemas/Cnj' } }
+        duplicatas: { type: array, items: { $ref: '#/components/schemas/Cnj' }, description: Repeated inside the same e-mail }
+
+    ResumoSincronizacao:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, nao_conectado, desconectado, erro] }
+        modo: { type: string, enum: [sombra, ativo], description: '"sombra" (shadow) records without touching the case queue' }
+        encontrados: { type: integer, description: Matching messages listed in Gmail }
+        novos: { type: integer, description: Messages read for the first time }
+        ignoradosRemetente: { type: integer, description: Rejected by the sender authentication check }
+        aplicados: { type: integer, description: E-mails applied to the case queue (active mode) }
+        erros: { type: array, items: { type: string } }
+
+paths:
+  /api/comandos:
+    get:
+      tags: [agent]
+      summary: Latest agent command, its progress and the registered computers
+      security: [{ gestorSession: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { oneOf: [{ $ref: '#/components/schemas/Comando' }, { type: 'null' }] }
+                  abandonada: { type: boolean, description: The run stopped reporting and is treated as abandoned }
+                  progresso:
+                    oneOf:
+                      - type: object
+                        properties:
+                          feitos: { type: integer }
+                          total: { type: integer }
+                      - type: 'null'
+                  agentes: { type: array, items: { $ref: '#/components/schemas/Agente' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [agent]
+      summary: Ask an agent to open the court systems and/or extract
+      description: Only one run can be active at a time. A target computer must exist and have a recent heartbeat.
+      security: [{ gestorSession: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                acao: { type: string, enum: [iniciar, abrir_sistemas, extrair], default: iniciar }
+                computador: { type: string, description: Agent id; omit to let any agent take it }
+      responses:
+        '200':
+          description: Command created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Comando' }
+        '400':
+          description: Unknown action or unknown computer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: 'The target agent is offline, or another run is already active (`{ data, jaAtivo: true }`)'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Comando' }
+                      jaAtivo: { type: boolean, const: true }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/classificar:
+    post:
+      tags: [cases]
+      summary: Latest pending draft for a case
+      security: [{ gestorSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [numero_cnj]
+              properties:
+                numero_cnj: { $ref: '#/components/schemas/Cnj' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Rascunho' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Case not found, or it has no pending draft
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/processos/atualizar-status:
+    post:
+      tags: [cases]
+      summary: Set a case's status
+      security: [{ gestorSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [numero_cnj, novo_status]
+              properties:
+                numero_cnj: { $ref: '#/components/schemas/Cnj' }
+                novo_status: { type: string, description: 'One of the values allowed by processos_status_atual_check' }
+      responses:
+        '200':
+          description: Updated case row
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, additionalProperties: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/rascunhos/atualizar-status:
+    post:
+      tags: [cases]
+      summary: Approve or reject a draft
+      description: Approving also stamps `data_revisao`.
+      security: [{ gestorSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rascunho_id, novo_status]
+              properties:
+                rascunho_id: { type: string, format: uuid }
+                novo_status: { type: string, enum: [pendente, aprovado, rejeitado] }
+      responses:
+        '200':
+          description: Updated draft
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Rascunho' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/email/processar:
+    post:
+      tags: [email]
+      summary: Queue the case numbers found in a pasted publication e-mail
+      security: [{ gestorSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [texto_email]
+              properties:
+                texto_email: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResultadoProcessamento' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/email/simular:
+    post:
+      tags: [email]
+      summary: Same as /api/email/processar, with a built-in sample e-mail when no text is sent
+      security: [{ gestorSession: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                texto_email: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ResultadoProcessamento'
+                  - type: object
+                    properties:
+                      email_usado: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /api/gmail/conectar:
+    get:
+      tags: [gmail]
+      summary: Start the Gmail OAuth flow
+      description: Sets a short-lived `state` cookie and redirects to Google's consent screen.
+      security: [{ gestorSession: [] }]
+      responses:
+        '307': { description: Redirect to Google }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/gmail/callback:
+    get:
+      tags: [gmail]
+      summary: OAuth callback from Google
+      description: |
+        Checks the `state` against the cookie in constant time, exchanges the code, stores the
+        refresh token encrypted (AES-256-GCM) and redirects to `/configuracoes?gmail=<result>`.
+        Failures are reported in that query parameter, never as an error status.
+      security: [{ gestorSession: [] }]
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string }, description: Set by Google when the user refuses }
+      responses:
+        '307': { description: Redirect back to the settings page }
+
+  /api/gmail/sincronizar:
+    post:
+      tags: [gmail]
+      summary: One Gmail sync round (called by pg_cron every 15 minutes)
+      description: Renews the access token, lists new publication e-mails, authenticates the sender, parses and stores them.
+      security: [{ syncBearer: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                aplicar_email_ids:
+                  type: array
+                  items: { type: string, format: uuid }
+                  description: Active mode only. E-mails already read in shadow mode to apply to the case queue now.
+      responses:
+        '200':
+          description: Round finished
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResumoSincronizacao' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500':
+          description: The round failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ResumoSincronizacao'
+                  - $ref: '#/components/schemas/Error'

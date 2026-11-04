@@ -134,6 +134,7 @@ The agent expects Chrome to be started with `--remote-debugging-port=9222` (`age
 
 ```
 web/      Next.js panel (app/, components/, lib/) and its specs and docs
+  openapi.yaml  OpenAPI 3.1 description of the panel's API routes
 agent/    Python agent: extractors, runner, analyzer, tests next to each module
   tools/    manual diagnostics (not run in CI)
   windows/  .bat launchers used on the office computers
