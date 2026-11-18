@@ -406,6 +406,7 @@ export type Database = {
           duplicata: boolean | null
           duracao_extracao_s: number | null
           email_id: string | null
+          falhas_nao_localizado: number
           fonte: string | null
           id: string
           lote_id: string | null
@@ -418,6 +419,7 @@ export type Database = {
           polo_passivo: string | null
           proxima_acao: string | null
           responsavel_id: string | null
+          robo_desistiu_em: string | null
           sistema: string | null
           status_atual: string | null
           tipo: string | null
@@ -434,6 +436,7 @@ export type Database = {
           duplicata?: boolean | null
           duracao_extracao_s?: number | null
           email_id?: string | null
+          falhas_nao_localizado?: number
           fonte?: string | null
           id?: string
           lote_id?: string | null
@@ -446,6 +449,7 @@ export type Database = {
           polo_passivo?: string | null
           proxima_acao?: string | null
           responsavel_id?: string | null
+          robo_desistiu_em?: string | null
           sistema?: string | null
           status_atual?: string | null
           tipo?: string | null
@@ -462,6 +466,7 @@ export type Database = {
           duplicata?: boolean | null
           duracao_extracao_s?: number | null
           email_id?: string | null
+          falhas_nao_localizado?: number
           fonte?: string | null
           id?: string
           lote_id?: string | null
@@ -474,6 +479,7 @@ export type Database = {
           polo_passivo?: string | null
           proxima_acao?: string | null
           responsavel_id?: string | null
+          robo_desistiu_em?: string | null
           sistema?: string | null
           status_atual?: string | null
           tipo?: string | null

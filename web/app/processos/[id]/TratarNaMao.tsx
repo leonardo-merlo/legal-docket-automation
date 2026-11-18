@@ -4,7 +4,7 @@
 // confirmação antes da ação destrutiva — nada disso existe em Server Component.
 
 import { useState, useTransition } from 'react'
-import { tratarNaMao, devolverAFila } from './actions'
+import { tratarNaMao, devolverAFila, tentarDeNovo } from './actions'
 
 type Props = {
   processoId: string
@@ -16,9 +16,11 @@ type Props = {
   pautaAtual?: string | null
   /** O rascunho da análise anterior já virou tarefa? */
   temTarefa?: boolean
+  /** O robô parou de procurar este processo no RUPE: quantas rodadas e desde quando (DD/MM/AAAA). */
+  roboDesistiu?: { falhas: number; desde: string } | null
 }
 
-export default function TratarNaMao({ processoId, tratadoNaMao, analiseAnterior, pautaAtual, temTarefa = false }: Props) {
+export default function TratarNaMao({ processoId, tratadoNaMao, analiseAnterior, pautaAtual, temTarefa = false, roboDesistiu = null }: Props) {
   const [isPending, startTransition] = useTransition()
   const [erro, setErro] = useState<string | null>(null)
   const [confirmando, setConfirmando] = useState(false)
@@ -30,6 +32,41 @@ export default function TratarNaMao({ processoId, tratadoNaMao, analiseAnterior,
       if (resultado.error) setErro(resultado.error)
       else setConfirmando(false)
     })
+  }
+
+  if (!tratadoNaMao && roboDesistiu) {
+    return (
+      <div className="rounded-lg border border-warn/40 bg-warn-subtle px-5 py-4">
+        <p className="text-sm font-medium text-warn">
+          O robô parou de procurar este processo em {roboDesistiu.desde}.
+        </p>
+        <p className="mt-1 text-sm text-text-secondary">
+          Ele pesquisou o número no RUPE em {roboDesistiu.falhas} rodadas e não achou
+          nenhuma vez. Às vezes a busca do RUPE falha mesmo com o processo lá, então
+          confira no site do tribunal. Se o processo existir, mande o robô tentar de
+          novo. Se não existir, ou se preferir resolver você, assuma ele na mão.
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled={isPending}
+            onClick={() => executar(() => tentarDeNovo(processoId))}
+            className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+          >
+            {isPending ? 'Aguarde...' : 'Tentar de novo'}
+          </button>
+          <button
+            type="button"
+            disabled={isPending}
+            onClick={() => executar(() => tratarNaMao(processoId))}
+            className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm font-medium text-text-secondary transition-colors hover:text-text disabled:opacity-50"
+          >
+            Tratar na mão
+          </button>
+        </div>
+        {erro && <p className="mt-2 text-sm text-error">{erro}</p>}
+      </div>
+    )
   }
 
   if (!tratadoNaMao) {
