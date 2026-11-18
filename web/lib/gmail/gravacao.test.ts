@@ -86,6 +86,13 @@ describe('decisão de gravação', () => {
     assert.equal(gravacao.dados.duplicata, false)
   })
 
+  test('publicação nova devolve ao robô o processo que ele tinha desistido de achar', () => {
+    const gravacao = decidirGravacao(processo(), { pje_status: 'erro_browser', observacoes: null }, CONTEXTO, HOJE)
+    assert.equal(gravacao.tipo, 'atualizar')
+    if (gravacao.tipo !== 'atualizar') return
+    assert.deepEqual([gravacao.dados.falhas_nao_localizado, gravacao.dados.robo_desistiu_em], [0, null])
+  })
+
   test('CNJ novo é inserido', () => {
     assert.equal(decidirGravacao(processo(), undefined, CONTEXTO, HOJE).tipo, 'inserir')
   })

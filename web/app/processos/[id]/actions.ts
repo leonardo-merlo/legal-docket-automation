@@ -165,9 +165,11 @@ export async function devolverAFila(processoId: string): Promise<AcaoResultado> 
     return { error: 'Este processo não está marcado como tratado na mão.' }
   }
 
+  // a conta zera: sem isso, quem o robô tinha desistido de achar voltaria como
+  // 'pendente' e continuaria fora da fila dele, sem aparecer em lugar nenhum
   const { error } = await supabase
     .from('processos')
-    .update({ pje_status: 'pendente' })
+    .update({ pje_status: 'pendente', falhas_nao_localizado: 0, robo_desistiu_em: null })
     .eq('id', processoId)
 
   if (error) return { error: `Erro ao devolver à fila: ${error.message}` }
@@ -187,6 +189,43 @@ export async function devolverAFila(processoId: string): Promise<AcaoResultado> 
       comentario: 'Devolvido à fila do robô — a próxima extração pode sobrescrever.',
     })
   }
+
+  revalidatePath(`/processos/${processoId}`)
+  revalidatePath('/dashboard')
+  revalidatePath('/processos')
+  return {}
+}
+
+/**
+ * Devolve ao robô um processo que ele desistiu de achar no RUPE, com a conta
+ * zerada. É para quem conferiu no site do tribunal e viu que o processo existe:
+ * a busca do RUPE falha à toa, e o mesmo processo que não aparece numa rodada
+ * pode aparecer na seguinte.
+ */
+export async function tentarDeNovo(processoId: string): Promise<AcaoResultado> {
+  await requireGestor()
+  const supabase = createAdminClient()
+
+  const { data: processo, error: processoError } = await supabase
+    .from('processos')
+    .select('robo_desistiu_em')
+    .eq('id', processoId)
+    .single()
+
+  if (processoError || !processo) {
+    return { error: `Erro ao carregar o processo: ${processoError?.message ?? 'não encontrado'}` }
+  }
+
+  if (!processo.robo_desistiu_em) {
+    return { error: 'O robô não desistiu deste processo — ele já está na fila.' }
+  }
+
+  const { error } = await supabase
+    .from('processos')
+    .update({ pje_status: 'pendente', falhas_nao_localizado: 0, robo_desistiu_em: null })
+    .eq('id', processoId)
+
+  if (error) return { error: `Erro ao devolver ao robô: ${error.message}` }
 
   revalidatePath(`/processos/${processoId}`)
   revalidatePath('/dashboard')
