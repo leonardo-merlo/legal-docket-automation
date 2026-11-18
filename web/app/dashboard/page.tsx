@@ -11,6 +11,13 @@ import { Tables } from '@/lib/supabase/types'
 import { atribuirRascunhos, resolverPublicacoes } from '@/lib/publicacoes'
 import { type RevisaoLinha } from './qualidade'
 import { type LinhaMotivo } from './erros'
+import NaoLocalizados from './NaoLocalizados'
+import {
+  MARCA_NAO_LOCALIZADO,
+  resumirNaoLocalizados,
+  type FalhaNaoLocalizado,
+  type NaoLocalizado,
+} from '@/lib/nao-localizados'
 
 // O PostgREST devolve no máximo 1000 linhas por resposta e não avisa quando corta:
 // pedir "tudo" e receber 1000 de 4472 é o tipo de erro que não quebra nada e faz
@@ -214,6 +221,41 @@ async function fetchLinhasMotivo(): Promise<LinhaMotivo[]> {
   return linhas
 }
 
+/**
+ * Só 'erro_browser': é quem o robô ainda tenta ou desistiu de achar. Quem foi
+ * tratado na mão já tem dono e sai daqui; quem foi achado vira 'processado'.
+ */
+async function fetchNaoLocalizados(): Promise<NaoLocalizado[]> {
+  const supabase = createAdminClient()
+  const { data: processos, error } = await supabase
+    .from('processos')
+    .select('id, numero_cnj, vara, robo_desistiu_em')
+    .eq('pje_status', 'erro_browser')
+    .ilike('motivo_ignorado', `%${MARCA_NAO_LOCALIZADO}%`)
+  if (error || !processos || processos.length === 0) return []
+
+  const falhas: FalhaNaoLocalizado[] = []
+  for (let pagina = 0; pagina < MAX_PAGINAS; pagina++) {
+    const de = pagina * TAMANHO_PAGINA
+    const { data, error: erroEventos } = await supabase
+      .from('eventos_extracao')
+      .select('numero_cnj, momento')
+      .eq('etapa', 'cnj.fim')
+      .eq('ok', false)
+      .ilike('detalhe', `%${MARCA_NAO_LOCALIZADO}%`)
+      .in('numero_cnj', processos.map((p) => p.numero_cnj))
+      .order('id', { ascending: true })
+      .range(de, de + TAMANHO_PAGINA - 1)
+    // sem o histórico a lista ainda serve: só perde a contagem de tentativas
+    if (erroEventos) break
+    const lote = data ?? []
+    falhas.push(...lote)
+    if (lote.length < TAMANHO_PAGINA) break
+  }
+
+  return resumirNaoLocalizados(processos, falhas)
+}
+
 async function fetchCountTarefasAbertas(): Promise<number> {
   const supabase = createAdminClient()
   const { count, error } = await supabase
@@ -227,7 +269,7 @@ async function fetchCountTarefasAbertas(): Promise<number> {
 export default async function DashboardPage() {
   const usuario = await requireGestor()
 
-  const [publicacoes, linhasRascunho, tarefasCount, revisoes, linhasMotivo, dadosGmail] = await Promise.all([
+  const [publicacoes, linhasRascunho, tarefasCount, revisoes, linhasMotivo, dadosGmail, naoLocalizados] = await Promise.all([
     fetchPublicacoes(),
     fetchRascunhos(),
     fetchCountTarefasAbertas(),
@@ -235,6 +277,7 @@ export default async function DashboardPage() {
     fetchLinhasMotivo(),
     // o painel de processos não pode cair junto se o Gmail falhar
     carregarPainelGmail().catch(() => null),
+    fetchNaoLocalizados(),
   ])
 
   const entradas = paraEntradas(publicacoes)
@@ -246,6 +289,7 @@ export default async function DashboardPage() {
 
       <main className="mx-auto max-w-5xl px-4 py-8">
         {dadosGmail && <div className="mb-6"><StatusGmail dados={dadosGmail} /></div>}
+        {naoLocalizados.length > 0 && <div className="mb-8"><NaoLocalizados processos={naoLocalizados} /></div>}
         {/* Os três cartões de baixo recebem dado CRU, e não pronto: eles seguem o
             filtro de mês, que só existe no cliente. Enviar o número já calculado
             aqui era o que fazia a taxa mudar com o filtro e os cartões não —

@@ -240,6 +240,9 @@ export default async function ProcessoPage({ params }: { params: Promise<{ id: s
                 analiseAnterior={analiseAnterior}
                 temTarefa={tarefas.some((t) => t.rascunho_id === maisRecente?.id)}
                 pautaAtual={dataPauta ? formatDataPauta(dataPauta) : null}
+                roboDesistiu={processo.robo_desistiu_em
+                  ? { falhas: processo.falhas_nao_localizado, desde: formatDate(processo.robo_desistiu_em) }
+                  : null}
               />
             </div>
           )}

@@ -19,6 +19,8 @@ export interface DadosProcesso {
   email_id: string
   pje_status: 'pendente'
   duplicata: false
+  falhas_nao_localizado: 0
+  robo_desistiu_em: null
   vara?: string
   comarca?: string
   polo_ativo?: string
@@ -89,6 +91,10 @@ export function decidirGravacao(
     email_id: contexto.emailId,
     pje_status: 'pendente',
     duplicata: false,
+    // publicação nova é motivo novo para procurar: o robô volta a tentar quem ele
+    // tinha desistido de achar no RUPE, com a conta zerada
+    falhas_nao_localizado: 0,
+    robo_desistiu_em: null,
   }
   // lote nulo não entra: no UPDATE apagaria o valor que já está no banco. A nota de
   // duplicado do parser também não: os números já estão em numero_publicacao.
